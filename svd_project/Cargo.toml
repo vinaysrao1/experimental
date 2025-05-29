@@ -1,0 +1,13 @@
+[package]
+name = "svd_project"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+nalgebra = "0.32"
+
+[[bin]]
+name = "svd_demo"
+path = "src/main.rs"
