@@ -62,3 +62,8 @@ println("converged            : ", pres.converged)
 println("δtip (FEM)           : ", δp, "  vs linear-elastic ", δp_lin)
 println("max eq. plastic strn : ", ᾱmax)
 println("yielded Gauss pts    : ", count(>(0.0), equivalent_plastic_strain(pmodel)), " / ", ngp)
+
+# Export both fields for ParaView. The plastic case shows the yielded zone near
+# the clamp (color by VonMises or EqPlasticStrain; Warp By Vector on Displacement).
+println("\nwrote: ", write_vtu(joinpath(@__DIR__, "cantilever_elastic"), model))
+println("wrote: ", write_vtu(joinpath(@__DIR__, "cantilever_plastic"), pmodel))

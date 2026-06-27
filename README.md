@@ -80,7 +80,25 @@ select_nodes(mesh, (x,y,z) -> x ≈ 0 && z > 0.5)   # arbitrary coordinate predi
 | `reset!(model)` | clear the solution and history (called automatically by `solve!`) |
 
 **Postprocessing:** `nodal_displacements(model)` (3 × nnodes),
-`gauss_stress(model)` (6 × ngp), `equivalent_plastic_strain(model)` (ngp).
+`gauss_stress(model)` (6 × ngp), `gauss_strain(model)` (6 × ngp total strain),
+`equivalent_plastic_strain(model)` (ngp), `von_mises(σ)` (scalar from a Voigt
+6-vector).
+
+### Visualizing stress/strain distributions
+
+Export a ParaView/VisIt file (dependency-free `.vtu` writer) and open it to see
+the full 3D field distribution:
+
+```julia
+solve!(model; nsteps = 20)
+write_vtu("result", model)          # -> result.vtu
+```
+
+The file carries per-node **Displacement** (use *Warp By Vector* for the deformed
+shape) and per-element (Gauss-point-averaged) **Stress** and **Strain** (Voigt
+tensors), **VonMises**, **MeanStress**, and **EqPlasticStrain** — color by any of
+these in ParaView. Both `examples/` scripts write `.vtu` files; the plastic
+cantilever shows the yielded zone near the clamp.
 
 `solve!` is idempotent — it resets the model on entry, so you can change loads or
 BCs and re-solve the same `model` object safely. Loading is ramped over `nsteps`
@@ -136,6 +154,7 @@ src/
   Assembly.jl            cached sparsity pattern, scatter-into-nzval assembly
   Solver.jl              Newton–Raphson, load stepping, history commit
   Model.jl               Model + high-level fix!/prescribe!/load!/reset! + postprocessing
+  Visualization.jl       dependency-free VTK (.vtu) export for ParaView/VisIt
 examples/                runnable tension-cube and cantilever demos
 test/                    unit, system, hard-validation, and performance tests
 docs/DESIGN.md           full design & verification specification

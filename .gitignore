@@ -5,3 +5,8 @@ Manifest.toml
 *.jl.*.cov
 *.jl.mem
 .DS_Store
+
+# generated visualization output
+*.vtu
+*.vtk
+*.pvd

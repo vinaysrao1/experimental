@@ -44,3 +44,7 @@ println("σ_xx (FEM)       : ", σxx)
 println("σ_xx (analytic)  : ", σ_analytic)
 println("rel error        : ", abs(σxx - σ_analytic) / σ_analytic)
 println("ᾱ (eq. pl. strn) : ", equivalent_plastic_strain(model)[1])
+
+# 8) Export the stress/strain fields for ParaView (open tension_cube.vtu)
+vtu = write_vtu(joinpath(@__DIR__, "tension_cube"), model)
+println("wrote            : ", vtu)

@@ -6,7 +6,8 @@ combined linear isotropic + kinematic hardening, Hex8 elements). See docs/DESIGN
 
 Public API (curated, small):
     box_mesh, on_face, select_nodes, J2Material, Model, fix!, prescribe!, load!,
-    solve!, nodal_displacements, gauss_stress, equivalent_plastic_strain
+    solve!, reset!, nodal_displacements, gauss_stress, gauss_strain,
+    equivalent_plastic_strain, von_mises, write_vtu
 """
 module PlasticityFEM
 
@@ -17,6 +18,7 @@ include("BoundaryConditions.jl")
 include("Assembly.jl")
 include("Model.jl")
 include("Solver.jl")
+include("Visualization.jl")
 
 using .Materials
 using .MeshMod
@@ -25,12 +27,14 @@ using .BoundaryConditions
 using .Assembly
 using .ModelMod
 using .Solver
+using .Visualization
 
 # --- curated public exports (DESIGN §5.1) ---
 export box_mesh, on_face, select_nodes
 export J2Material
 export Model, fix!, prescribe!, load!, solve!, reset!
 export nodal_displacements, gauss_stress, equivalent_plastic_strain
+export write_vtu, gauss_strain, von_mises
 export SolveResult
 
 # Re-export selected internals useful for tests / advanced use.
