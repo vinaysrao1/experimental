@@ -848,3 +848,33 @@ and are reflected in the code:
    element's node offsets against element 1's with scalar arithmetic — alloc-free
    and exact ("identical up to translation"), so build-time allocation is a small
    constant (~87 kB total).
+
+### 9.1 Measured 10M budget (revises the §5 estimate)
+
+`test/scaling_validation.jl` sweeps n=8…48 and extrapolates the **measured**
+per-DOF constants to N=10.3M. All 14 validation gates pass; the measured budget
+is heavier than the §5 estimate because the **6-mode rigid-body near-null-space
+inflates the AMG hierarchy** (the §5 estimate assumed a scalar hierarchy):
+
+| Line item | Measured @10M |
+|---|---|
+| K (nzval + rowval + colptr, Int64) | 12.0 GB |
+| GaussState ×2 | 7.6 GB |
+| **AMG hierarchy** (measured 2587 B/DOF, operator complexity 1.33) | **24.9 GB** ← binding |
+| CG vectors, edofs, nullspace, mesh/misc | 2.1 GB |
+| **TOTAL (steady-state)** | **46.7 GB** (< 64 GB; **17.3 GB headroom**) |
+
+Pattern-build transient peak ≈ 12.7 GB (vs the 47 GB COO path that was deleted).
+
+**Measured scaling (the optimality claims, confirmed):** CG-iters vs N slope
+**+0.13** (flat ⇒ O(N) flops — *decisive*; the no-near-null-space control grows at
+**+0.31**, proving the near-null-space is what buys O(N)); assembly time and
+CG-time/iter both ~**+1.07** (O(N)); bytes/DOF tail slope **+0.026** (flat ⇒ linear
+memory); nnz/N → 81; flops/DOF/Newton-iter ≈ **1.5×10⁴** (mesh-independent).
+
+**Projected serial wall-time @10M ≈ 2500 s/load step (~42 min)**, of which AMG
+*setup* (~740 s, superlinear ~N^1.36) is the long pole — amortized once per load
+step by the reuse policy (§1.3) and the prime target for the threaded/parallel
+coarsening follow-on. The Newton-loop portion (assembly + CG) is O(N) and is what
+the §3 threading accelerates. Headroom and O(N) work both hold; AMG hierarchy
+memory and setup cost are the levers if a future revision needs to push past 10M.
