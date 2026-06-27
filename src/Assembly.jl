@@ -1,34 +1,44 @@
 """
     Assembly
 
-Global sparsity pattern (cached COO → CSC mapping) and assembly of the global
-tangent and residual by scattering element contributions into `nzval`.
-See DESIGN.md §5.1, §7.
+Global sparsity pattern and assembly of the global tangent and residual by
+scattering element contributions into `nzval`. See DESIGN.md §5.1, §7 and the
+scaling redesign SCALING.md §2.
+
+Scaling changes (SCALING.md §2):
+- `build_sparsity` builds the CSC skeleton by **count-then-fill from node
+  adjacency** — it never materializes the `nelem·576` COO triplet arrays
+  (≈47 GB transient at 10M).
+- `SparsityPattern` drops the per-element scatter `map` (≈15 GB at 10M); numeric
+  `assemble!` scatters via an **on-the-fly CSC column binary search**.
+- The pattern/assembler are **generic over the index type `Ti`**; large problems
+  default to `Int32` (≈3.3 GB saved at 10M), with an `Int64` fallback when
+  `nnz ≥ typemax(Int32)`.
+- An analytic **8-color** element partition (box parity `(i%2,j%2,k%2)`) is
+  generated here for the race-free threaded assembly of Phase 3.
 """
 module Assembly
 
 using SparseArrays
 using StaticArrays
 using ..MeshMod: Mesh, dof
-using ..Elements: ElementCache, element_force_tangent!
+using ..Elements: ElementCache, element_force_tangent!, element_geometry
 using ..Materials: J2Material
 
-export SparsityPattern, build_sparsity, assemble!
+export SparsityPattern, build_sparsity, assemble!, assemble_threaded!
 
 """
-    SparsityPattern
+    SparsityPattern{Ti}
 
-Cached mapping from each element's 24×24 local stiffness entry to its position
-in the global CSC `nzval` array. Built once; reused every Newton iteration so
-assembly is a pure scatter into `nzval` (no `sparse()` rebuild) (DESIGN §7).
-
-`K` is the prebuilt CSC skeleton (correct structure, zero values). `map[e]` is a
-length-576 vector of nzval indices, column-major over the 24×24 local block.
+CSC skeleton (`K`, with `nzval` used as the assembly scratch) plus the element
+DOF map (`edofs`, 24×nelem) and the 8-color element partition (`colors`) for
+threaded assembly. No per-element scatter map is stored — numeric assembly does
+an on-the-fly CSC column search (SCALING.md §2.3, §2.6).
 """
-struct SparsityPattern
-    K::SparseMatrixCSC{Float64,Int}
-    edofs::Matrix{Int}          # 24 × nelem element DOF maps
-    map::Vector{Vector{Int}}    # [elem] -> 576 nzval indices
+struct SparsityPattern{Ti<:Integer}
+    K::SparseMatrixCSC{Float64,Ti}
+    edofs::Matrix{Ti}                 # 24 × nelem element DOF maps
+    colors::Vector{Vector{Int}}       # element-id partition; no two share a node
 end
 
 """
@@ -44,119 +54,337 @@ Global DOFs of element e in local order (node-major: u1x,u1y,u1z,...,u8z).
     end
 end
 
-"""
-    build_sparsity(mesh) -> SparsityPattern
+# Node→node adjacency (each node lists itself + every node sharing an element
+# with it), as sorted, deduplicated vectors. O(nelem) time, O(N) memory; ≤27
+# neighbors/node on a structured Hex8 grid. This replaces the COO transient.
+function _node_adjacency(mesh::Mesh)
+    nnodes = mesh.nnodes
+    elements = mesh.elements
+    # gather (unsorted, with duplicates) neighbor lists
+    adj = [Int[] for _ in 1:nnodes]
+    @inbounds for e in 1:mesh.nelem
+        for a in 1:8
+            na = elements[a, e]
+            la = adj[na]
+            for b in 1:8
+                push!(la, elements[b, e])
+            end
+        end
+    end
+    @inbounds for n in 1:nnodes
+        v = adj[n]
+        sort!(v)
+        unique!(v)
+    end
+    return adj
+end
 
-Build the global CSC skeleton from element connectivity and cache, for every
-element, the nzval index of each of its 576 local entries (DESIGN §7).
 """
-function build_sparsity(mesh::Mesh)
+    build_sparsity(mesh; Ti=nothing) -> SparsityPattern
+
+Build the global CSC skeleton (zero values) by count-then-fill from node
+adjacency (SCALING.md §2.4) — no COO triplet array is ever allocated. Also builds
+the element DOF map and the 8-color element partition.
+
+The index type `Ti` defaults to `Int` (Int64). Int32 indices would save ~3.3 GB
+at 10M, but the smoothed-aggregation AMG preconditioner with a near-null-space
+(the rigid-body modes that flatten the CG iteration count — SCALING.md §1.3, R1)
+builds Int64 prolongation operators internally and cannot form an Int32 hierarchy,
+so an Int32 K would force a retained Int64 copy for AMG (net *more* memory). One
+shared Int64 K is the leaner, simpler choice. Pass `Ti=Int32` to force Int32 (only
+sound with `amg=:rs` via an internal copy, or the `:direct`/Jacobi paths).
+"""
+function build_sparsity(mesh::Mesh; Ti::Union{Type{<:Integer},Nothing}=nothing)
     ndof = 3 * mesh.nnodes
+    nnodes = mesh.nnodes
+
+    adj = _node_adjacency(mesh)
+
+    # nnz per scalar column = 3 * (#neighbor nodes of that column's node).
+    # Each node owns 3 consecutive columns (DOFs) with identical row structure.
+    nnz_total = 0
+    @inbounds for n in 1:nnodes
+        nnz_total += 3 * length(adj[n])   # one column's nnz
+    end
+    nnz_total *= 3   # three columns per node share the same nnz count
+
+    Tidx = Ti === nothing ? Int : Ti
+
+    colptr = Vector{Tidx}(undef, ndof + 1)
+    rowval = Vector{Tidx}(undef, nnz_total)
+    nzval = zeros(Float64, nnz_total)
+
+    # Pass 1 (count) → colptr by prefix sum.
+    colptr[1] = 1
+    @inbounds for jnode in 1:nnodes
+        ncol = 3 * length(adj[jnode])
+        base = 3 * (jnode - 1)
+        for comp in 1:3
+            col = base + comp
+            colptr[col + 1] = colptr[col] + ncol
+        end
+    end
+
+    # Pass 2 (fill) → rowval: for every column of a node, write the sorted DOF
+    # rows of its neighbor stencil (each neighbor node contributes 3 DOFs).
+    @inbounds for jnode in 1:nnodes
+        nbrs = adj[jnode]
+        base = 3 * (jnode - 1)
+        for comp in 1:3
+            col = base + comp
+            p = colptr[col]
+            for nb in nbrs              # nbrs sorted → rows written ascending
+                r0 = 3 * (nb - 1)
+                rowval[p]     = r0 + 1
+                rowval[p + 1] = r0 + 2
+                rowval[p + 2] = r0 + 3
+                p += 3
+            end
+        end
+    end
+
+    K = SparseMatrixCSC{Float64,Tidx}(ndof, ndof, colptr, rowval, nzval)
+
+    # element DOF map (Tidx)
     nelem = mesh.nelem
-    edofs = Matrix{Int}(undef, 24, nelem)
-    for e in 1:nelem
+    edofs = Matrix{Tidx}(undef, 24, nelem)
+    @inbounds for e in 1:nelem
         ed = element_dofs(mesh.elements, e)
-        @inbounds for i in 1:24
+        for i in 1:24
             edofs[i, e] = ed[i]
         end
     end
 
-    # COO triplets (values 0) to define structure; sparse() coalesces duplicates.
-    nnz_est = nelem * 576
-    I = Vector{Int}(undef, nnz_est)
-    J = Vector{Int}(undef, nnz_est)
-    p = 0
-    @inbounds for e in 1:nelem
-        for c in 1:24, r in 1:24
-            p += 1
-            I[p] = edofs[r, e]
-            J[p] = edofs[c, e]
-        end
-    end
-    V = zeros(Float64, nnz_est)
-    K = sparse(I, J, V, ndof, ndof)   # coalesced CSC skeleton
-
-    # For each element local entry (r,c) find its position in K.nzval.
-    colptr = K.colptr; rowval = K.rowval
-    map = Vector{Vector{Int}}(undef, nelem)
-    @inbounds for e in 1:nelem
-        idxs = Vector{Int}(undef, 576)
-        local_p = 0
-        for c in 1:24
-            gcol = edofs[c, e]
-            colstart = colptr[gcol]; colend = colptr[gcol+1] - 1
-            for r in 1:24
-                local_p += 1
-                grow = edofs[r, e]
-                # binary search within column (rowval sorted ascending)
-                lo = colstart; hi = colend; pos = 0
-                while lo <= hi
-                    mid = (lo + hi) >>> 1
-                    rv = rowval[mid]
-                    if rv == grow
-                        pos = mid; break
-                    elseif rv < grow
-                        lo = mid + 1
-                    else
-                        hi = mid - 1
-                    end
-                end
-                idxs[local_p] = pos
-            end
-        end
-        map[e] = idxs
-    end
-    return SparsityPattern(K, edofs, map)
+    colors = element_colors(mesh)
+    return SparsityPattern{Tidx}(K, edofs, colors)
 end
 
 """
-    assemble!(sp, mat, cache, U, εp, β, ᾱ, σ, R; commit=false)
+    element_colors(mesh) -> Vector{Vector{Int}}
+
+Analytic 8-color partition of the box elements by parity `(i%2,j%2,k%2)`
+(SCALING.md §3.1). Same-color elements are ≥2 apart in every axis ⇒ share no
+node ⇒ their scatters touch disjoint DOFs ⇒ race-free `@threads` assembly with no
+atomics. Falls back to a single color (serial) for a non-box element count.
+"""
+function element_colors(mesh::Mesh)
+    # recover (nx,ny,nz) from the structured numbering, if possible
+    nxyz = _box_dims(mesh)
+    if nxyz === nothing
+        return [collect(1:mesh.nelem)]
+    end
+    nx, ny, nz = nxyz
+    colors = [Int[] for _ in 1:8]
+    e = 0
+    @inbounds for k in 0:nz-1, j in 0:ny-1, i in 0:nx-1
+        e += 1
+        c = (i & 1) + 2 * (j & 1) + 4 * (k & 1) + 1
+        push!(colors[c], e)
+    end
+    # drop empty colors (e.g. nx=ny=nz=1 ⇒ only 1 nonempty)
+    return [c for c in colors if !isempty(c)]
+end
+
+# Recover (nx,ny,nz) from a box_mesh by inspecting node coordinates. Returns
+# nothing if the mesh does not look like a structured axis-aligned box grid.
+function _box_dims(mesh::Mesh)
+    nodes = mesh.nodes
+    nnodes = mesh.nnodes
+    nelem = mesh.nelem
+    nelem == 0 && return nothing
+    xs = unique(round.(@view(nodes[1, :]); digits=12))
+    ys = unique(round.(@view(nodes[2, :]); digits=12))
+    zs = unique(round.(@view(nodes[3, :]); digits=12))
+    nx = length(xs) - 1; ny = length(ys) - 1; nz = length(zs) - 1
+    if nx >= 1 && ny >= 1 && nz >= 1 &&
+       nx * ny * nz == nelem && (nx + 1) * (ny + 1) * (nz + 1) == nnodes
+        return (nx, ny, nz)
+    end
+    return nothing
+end
+
+# Binary-search a CSC column [colstart,colend] for global row `grow`; returns the
+# nzval index (or 0 if not present, which never happens for a correct pattern).
+@inline function _find_nz(rowval, colstart::Integer, colend::Integer, grow::Integer)
+    lo = colstart; hi = colend
+    @inbounds while lo <= hi
+        mid = (lo + hi) >>> 1
+        rv = rowval[mid]
+        if rv == grow
+            return mid
+        elseif rv < grow
+            lo = mid + 1
+        else
+            hi = mid - 1
+        end
+    end
+    return zero(colstart)
+end
+
+"""
+    assemble!(sp, mat, cache, U, εp, β, ᾱ, σ, R; commit=false, threaded=false)
         -> (K, R)
 
-Assemble global tangent (into `sp.K.nzval`) and internal-force residual `R`
-from element contributions + per-GP return maps (DESIGN §5.1, §7). O(1) heap
-allocation independent of nelem; element kernel is allocation-free.
+Assemble global tangent (into `sp.K.nzval`) and internal-force residual `R` from
+element contributions + per-GP return maps (DESIGN §5.1, §7; SCALING.md §2.6).
+O(1) heap allocation independent of nelem (the on-the-fly scatter does not
+allocate per element). `R` is filled with F_int (the caller subtracts F_ext).
 
-`R` is filled with F_int (the caller subtracts F_ext to form the residual).
+`threaded=true` uses the 8-color partition for race-free multithreaded assembly
+(SCALING.md §3.1).
 """
 function assemble!(sp::SparsityPattern, mat::J2Material, cache::ElementCache,
                    U::Vector{Float64},
                    εp::Matrix{Float64}, β::Matrix{Float64}, ᾱ::Vector{Float64},
                    σ::Matrix{Float64}, R::Vector{Float64};
                    commit::Bool=false)
-    return _assemble!(sp, mat, cache, U, εp, β, ᾱ, σ, R, Val(commit))
+    # Resolve `commit` to a *statically typed* Val via an explicit branch (not
+    # `Val(commit)`, which would be a runtime-typed Union forcing a dynamic
+    # dispatch that boxes the SparseMatrixCSC return — ~10 kB). The explicit
+    # branch keeps both call sites fully inferred and the assembly O(1)-alloc,
+    # preserving the v1 T20 `@allocated` bound.
+    if commit
+        return _assemble!(sp, mat, cache, U, εp, β, ᾱ, σ, R, Val(true))
+    else
+        return _assemble!(sp, mat, cache, U, εp, β, ᾱ, σ, R, Val(false))
+    end
 end
 
-# Parametric on the Val so element_force_tangent! specializes on COMMIT and the
-# loop stays allocation-free (no dynamic dispatch / boxing of the SVector/SMatrix
-# return). DESIGN §7.6.
 function _assemble!(sp::SparsityPattern, mat::J2Material, cache::ElementCache,
                     U::Vector{Float64},
                     εp::Matrix{Float64}, β::Matrix{Float64}, ᾱ::Vector{Float64},
                     σ::Matrix{Float64}, R::Vector{Float64},
-                    commit::Val{COMMIT}) where {COMMIT}
-    nzval = sp.K.nzval
-    fill!(nzval, 0.0)
+                    cv::Val{COMMIT}) where {COMMIT}
+    fill!(sp.K.nzval, 0.0)
     fill!(R, 0.0)
-    nelem = size(sp.edofs, 2)
-    @inbounds for e in 1:nelem
-        # gather element displacement (Val(24) so ntuple unrolls allocation-free)
-        ue = SVector{24,Float64}(ntuple(i -> U[sp.edofs[i, e]], Val(24)))
-        Fe, Ke = element_force_tangent!(mat, cache.B[e], cache.detJw[e], ue,
-                                        εp, β, ᾱ, e, σ, commit)
-        # scatter F_int
-        for i in 1:24
-            R[sp.edofs[i, e]] += Fe[i]
-        end
-        # scatter K into nzval via cached map (column-major over 24×24)
-        idxs = sp.map[e]
-        lp = 0
-        for c in 1:24, r in 1:24
-            lp += 1
-            nzval[idxs[lp]] += Ke[r, c]
-        end
+    # Resolve the uniform/non-uniform geometry choice ONCE (outside the hot loop)
+    # to a compile-time Val, so the inner loop has no geometry branch / type union
+    # and stays allocation-free per element (SCALING.md §2.2, §2.6).
+    if cache.uniform
+        _assemble_loop!(sp, mat, cache, U, εp, β, ᾱ, σ, R, cv, Val(true))
+    else
+        _assemble_loop!(sp, mat, cache, U, εp, β, ᾱ, σ, R, cv, Val(false))
     end
     return sp.K, R
+end
+
+@inline function _elem_geom(cache::ElementCache, e::Integer, ::Val{true})
+    return cache.Bref, cache.detJwref
+end
+@inline function _elem_geom(cache::ElementCache, e::Integer, ::Val{false})
+    return element_geometry(cache, e)
+end
+
+function _assemble_loop!(sp::SparsityPattern, mat::J2Material, cache::ElementCache,
+                         U::Vector{Float64},
+                         εp::Matrix{Float64}, β::Matrix{Float64}, ᾱ::Vector{Float64},
+                         σ::Matrix{Float64}, R::Vector{Float64},
+                         ::Val{COMMIT}, uv::Val{UNIFORM}) where {COMMIT,UNIFORM}
+    nzval = sp.K.nzval
+    colptr = sp.K.colptr
+    rowval = sp.K.rowval
+    edofs = sp.edofs
+    nelem = size(edofs, 2)
+    @inbounds for e in 1:nelem
+        ue = SVector{24,Float64}(ntuple(i -> U[edofs[i, e]], Val(24)))
+        Bs, detJw = _elem_geom(cache, e, uv)
+        Fe, Ke = element_force_tangent!(mat, Bs, detJw, ue,
+                                        εp, β, ᾱ, e, σ, Val(COMMIT))
+        # scatter K via on-the-fly CSC column binary search (SCALING.md §2.3)
+        for c in 1:24
+            gcol = edofs[c, e]
+            colstart = colptr[gcol]
+            colend = colptr[gcol + 1] - 1
+            for r in 1:24
+                idx = _find_nz(rowval, colstart, colend, edofs[r, e])
+                nzval[idx] += Ke[r, c]
+            end
+        end
+        for i in 1:24
+            R[edofs[i, e]] += Fe[i]
+        end
+    end
+    return nothing
+end
+
+"""
+    assemble_threaded!(sp, mat, cache, U, εp, β, ᾱ, σ, R; commit=false) -> (K, R)
+
+Race-free 8-color multithreaded assembly (SCALING.md §3.1). Identical result to
+the serial `assemble!`; uses `sp.colors` so same-color elements write disjoint
+DOFs (no atomics). Run with `JULIA_NUM_THREADS > 1`.
+"""
+function assemble_threaded!(sp::SparsityPattern, mat::J2Material, cache::ElementCache,
+                            U::Vector{Float64},
+                            εp::Matrix{Float64}, β::Matrix{Float64}, ᾱ::Vector{Float64},
+                            σ::Matrix{Float64}, R::Vector{Float64};
+                            commit::Bool=false)
+    # Static Val branch (see `assemble!`): avoids dynamic-dispatch boxing.
+    if commit
+        return _assemble_threaded_entry!(sp, mat, cache, U, εp, β, ᾱ, σ, R, Val(true))
+    else
+        return _assemble_threaded_entry!(sp, mat, cache, U, εp, β, ᾱ, σ, R, Val(false))
+    end
+end
+
+function _assemble_threaded_entry!(sp::SparsityPattern, mat::J2Material, cache::ElementCache,
+                                   U::Vector{Float64},
+                                   εp::Matrix{Float64}, β::Matrix{Float64}, ᾱ::Vector{Float64},
+                                   σ::Matrix{Float64}, R::Vector{Float64},
+                                   cv::Val{COMMIT}) where {COMMIT}
+    fill!(sp.K.nzval, 0.0)
+    fill!(R, 0.0)
+    _assemble_threaded!(sp, mat, cache, U, εp, β, ᾱ, σ, R, cv)
+    return sp.K, R
+end
+
+# Race-free threaded assembly: for each color (whose elements share no node, so
+# they write disjoint nzval/R entries) thread over its element list. R is also
+# race-free because same-color elements own disjoint DOFs (SCALING.md §3.1).
+function _assemble_threaded!(sp::SparsityPattern, mat::J2Material, cache::ElementCache,
+                             U::Vector{Float64},
+                             εp::Matrix{Float64}, β::Matrix{Float64}, ᾱ::Vector{Float64},
+                             σ::Matrix{Float64}, R::Vector{Float64},
+                             ::Val{COMMIT}) where {COMMIT}
+    for color in sp.colors
+        Threads.@threads for ci in eachindex(color)
+            e = color[ci]
+            _assemble_one!(sp, mat, cache, U, εp, β, ᾱ, σ, R, Val(COMMIT), e)
+        end
+    end
+    return nothing
+end
+
+# Assemble a single element e (used by the threaded path). Allocation-free.
+@inline function _assemble_one!(sp::SparsityPattern, mat::J2Material, cache::ElementCache,
+                                U::Vector{Float64},
+                                εp::Matrix{Float64}, β::Matrix{Float64}, ᾱ::Vector{Float64},
+                                σ::Matrix{Float64}, R::Vector{Float64},
+                                ::Val{COMMIT}, e::Integer) where {COMMIT}
+    nzval = sp.K.nzval
+    colptr = sp.K.colptr
+    rowval = sp.K.rowval
+    edofs = sp.edofs
+    @inbounds begin
+        ue = SVector{24,Float64}(ntuple(i -> U[edofs[i, e]], Val(24)))
+        Bs, detJw = element_geometry(cache, e)
+        Fe, Ke = element_force_tangent!(mat, Bs, detJw, ue,
+                                        εp, β, ᾱ, e, σ, Val(COMMIT))
+        for c in 1:24
+            gcol = edofs[c, e]
+            colstart = colptr[gcol]
+            colend = colptr[gcol + 1] - 1
+            for r in 1:24
+                grow = edofs[r, e]
+                idx = _find_nz(rowval, colstart, colend, grow)
+                nzval[idx] += Ke[r, c]
+            end
+        end
+        for i in 1:24
+            R[edofs[i, e]] += Fe[i]
+        end
+    end
+    return nothing
 end
 
 end # module

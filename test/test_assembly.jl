@@ -12,10 +12,27 @@ using Test
     sp = build_sparsity(mesh)
     ndof = 3 * mesh.nnodes
     @test size(sp.K) == (ndof, ndof)
-    # map indices all resolved (no zeros)
+    # CSC structure is valid: every column sorted, every element entry resolves.
+    K = sp.K
+    @test issorted(K.rowval[K.colptr[1]:(K.colptr[2]-1)])
+    # the on-the-fly scatter must find a stored slot for every (r,c) of every elem
     for e in 1:mesh.nelem
-        @test all(sp.map[e] .> 0)
+        for c in 1:24, r in 1:24
+            gcol = Int(sp.edofs[c, e]); grow = Int(sp.edofs[r, e])
+            @test K[grow, gcol] !== nothing   # entry exists (no structural miss)
+            @test grow in K.rowval[K.colptr[gcol]:(K.colptr[gcol+1]-1)]
+        end
     end
+    # cross-check against the reference sparse() pattern (same nonzero structure)
+    nelem = mesh.nelem
+    I = Int[]; J = Int[]
+    for e in 1:nelem, c in 1:24, r in 1:24
+        push!(I, Int(sp.edofs[r, e])); push!(J, Int(sp.edofs[c, e]))
+    end
+    Kref = sparse(I, J, ones(length(I)), ndof, ndof)
+    @test nnz(sp.K) == nnz(Kref)
+    @test sp.K.colptr == Kref.colptr
+    @test sp.K.rowval == Kref.rowval
 end
 
 @testset "T16 stiffness symmetry & SPD (elastic)" begin

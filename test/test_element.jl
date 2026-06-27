@@ -39,13 +39,14 @@ end
     cache = precompute_cache(mesh.nodes, mesh.elements)
     vol_elem = (lx/nx) * (ly/ny) * (lz/nz)
     for e in 1:mesh.nelem
+        _, detJw = element_geometry(cache, e)
         # each GP detJ = element volume / 8
         for g in 1:8
-            @test cache.detJw[e][g] ≈ vol_elem / 8 rtol=1e-12
-            @test cache.detJw[e][g] > 0
+            @test detJw[g] ≈ vol_elem / 8 rtol=1e-12
+            @test detJw[g] > 0
         end
         # Σ detJ·w over element = element volume
-        @test sum(cache.detJw[e]) ≈ vol_elem rtol=1e-12
+        @test sum(detJw) ≈ vol_elem rtol=1e-12
     end
 end
 
@@ -55,8 +56,9 @@ end
     # uniform translation
     t = SVector{3,Float64}(0.3, -0.2, 0.5)
     ue_trans = SVector{24,Float64}(ntuple(c -> t[(c-1)%3+1], 24))
+    Bs, detJw = element_geometry(cache, 1)
     for g in 1:8
-        ε = cache.B[1][g] * ue_trans
+        ε = Bs[g] * ue_trans
         @test norm(ε) <= 1e-12
     end
     # infinitesimal rotation: u = ω × (x - x0)
@@ -70,14 +72,14 @@ end
         cross(ω, x)[comp]
     end)
     for g in 1:8
-        ε = cache.B[1][g] * ue_rot
+        ε = Bs[g] * ue_rot
         @test norm(ε) <= 1e-10   # zero to linear order
     end
     # element internal force from rigid translation = 0
     mat = J2Material(E=210e3, ν=0.3, σy0=1e9)
     ngp = 8
     εp = zeros(6,ngp); β = zeros(6,ngp); ᾱ = zeros(ngp); σ = zeros(6,ngp)
-    Fe, _ = element_force_tangent!(mat, cache.B[1], cache.detJw[1], ue_trans,
+    Fe, _ = element_force_tangent!(mat, Bs, detJw, ue_trans,
                                    εp, β, ᾱ, 1, σ, Val(false))
     @test norm(Fe) <= 1e-9
 end

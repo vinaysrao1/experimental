@@ -59,7 +59,7 @@ known column to the RHS and placing 1 on the diagonal (DESIGN §5, §7).
 Operates on the residual system K·δU = −R. The correction at a constrained DOF
 must be δU[d] = g − U[d]. We enforce this with symmetric row/col elimination.
 """
-function impose_dirichlet!(K::SparseMatrixCSC{Float64,Int}, R::Vector{Float64},
+function impose_dirichlet!(K::SparseMatrixCSC{Float64,<:Integer}, R::Vector{Float64},
                            bc::DirichletBC, λ::Float64, U::Vector{Float64})
     nzval = K.nzval
     rowval = K.rowval

@@ -33,7 +33,7 @@ end
         ngp = 8
         εp = zeros(6,ngp); β = zeros(6,ngp); ᾱ = zeros(ngp); σ = zeros(6,ngp)
         ue = SVector{24,Float64}(ntuple(i -> 0.001*i, 24))
-        B1 = cache.B[1]; Jw1 = cache.detJw[1]
+        B1, Jw1 = element_geometry(cache, 1)
         element_force_tangent!(mat, B1, Jw1, ue, εp, β, ᾱ, 1, σ, Val(false))  # warmup
         a = @allocated element_force_tangent!(mat, B1, Jw1, ue, εp, β, ᾱ, 1, σ, Val(false))
         ac = @allocated element_force_tangent!(mat, B1, Jw1, ue, εp, β, ᾱ, 1, σ, Val(true))

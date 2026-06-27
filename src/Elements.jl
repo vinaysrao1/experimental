@@ -12,8 +12,8 @@ using LinearAlgebra
 using ..Materials: J2Material, return_map
 
 export hex8_shape, hex8_dshape, jacobian, bmatrix, precompute_cache,
-       element_force_tangent!, ElementCache, GAUSS_PTS, GAUSS_WTS,
-       NODE_NAT
+       element_force_tangent!, ElementCache, element_geometry, element_coords,
+       GAUSS_PTS, GAUSS_WTS, NODE_NAT
 
 # Natural coordinates of the 8 nodes (DESIGN §3.1, VTK_HEXAHEDRON ordering)
 const NODE_NAT = SMatrix{8,3,Float64,24}(
@@ -109,48 +109,132 @@ from spatial shape-function gradients dN/dx (8×3) (DESIGN §3.4).
 end
 
 """
+    element_geometry(Xe) -> (Bs, detJw)
+
+Compute the per-Gauss-point B-matrices `Bs::SVector{8,SMatrix{6,24}}` and
+`detJ·w` weights `detJw::SVector{8}` for an element with node coordinates
+`Xe::SMatrix{8,3}`. Allocation-free; this is the v1 geometry math factored out so
+it can be reused for both the cached reference element and the on-the-fly fallback
+(SCALING.md §2.2).
+"""
+@inline function element_geometry(Xe::SMatrix{8,3,Float64,24})
+    # `Val(8)` makes the tuple length a compile-time constant so `ntuple` fully
+    # unrolls and the per-GP `geo` tuple stays on the stack — keeping this kernel
+    # allocation-free (a plain `ntuple(_, 8)` here heap-allocates ~87 kB/call,
+    # which would blow both the build-time uniformity scan and the non-uniform
+    # assembly memory budget at scale).
+    geo = ntuple(Val(8)) do g
+        dN = hex8_dshape(GAUSS_PTS[g])
+        J = jacobian(Xe, dN)
+        (bmatrix(dN * inv(J)), det(J) * GAUSS_WTS[g])
+    end
+    Bs = SVector{8,SMatrix{6,24,Float64,144}}(ntuple(g -> geo[g][1], Val(8)))
+    detJw = SVector{8,Float64}(ntuple(g -> geo[g][2], Val(8)))
+    return Bs, detJw
+end
+
+# Element node coordinates as an 8×3 SMatrix (allocation-free).
+@inline function element_coords(nodes::Matrix{Float64}, elements::AbstractMatrix{<:Integer}, e::Integer)
+    return SMatrix{8,3,Float64,24}(ntuple(24) do k
+        a = (k - 1) % 8 + 1
+        j = (k - 1) ÷ 8 + 1
+        nodes[j, elements[a, e]]
+    end)
+end
+
+"""
     ElementCache
 
-Per-element cached geometry: B-matrices and detJ·w at every Gauss point
-(DESIGN §4.4). Geometry is independent of U, so these are computed once and
-reused every Newton iteration.
+Element geometry source for the assembler (SCALING.md §2.2). For a **uniform box
+mesh** every element is geometrically identical up to translation, so a *single*
+reference set of B-matrices and detJ·w is cached (`uniform=true`) — replacing the
+v1 per-element cache (≈31 GB at 10M) with ≈9 kB. For non-uniform meshes
+(`uniform=false`) the cache stores only the node coordinates and recomputes the
+geometry on the fly per element (zero extra memory; modest compute).
+
+Fields:
+- `uniform` — true if every element shares one reference geometry.
+- `Bref`, `detJwref` — the single reference set (valid iff `uniform`).
+- `nodes`, `elements` — kept for the on-the-fly recompute fallback.
 """
 struct ElementCache
-    B::Vector{SVector{8,SMatrix{6,24,Float64,144}}}   # [elem] -> (B per gp)
-    detJw::Vector{SVector{8,Float64}}                  # [elem] -> (detJ*w per gp)
+    uniform::Bool
+    Bref::SVector{8,SMatrix{6,24,Float64,144}}
+    detJwref::SVector{8,Float64}
+    nodes::Matrix{Float64}
+    elements::Matrix{Int}
+end
+
+"""
+    element_geometry(cache, e) -> (Bs, detJw)
+
+Geometry for element `e`: the cached reference set if the mesh is uniform,
+otherwise recomputed on the fly from node coordinates. Allocation-free — used in
+the hot assembly loop (SCALING.md §2.2).
+"""
+@inline function element_geometry(cache::ElementCache, e::Integer)
+    if cache.uniform
+        return cache.Bref, cache.detJwref
+    else
+        Xe = element_coords(cache.nodes, cache.elements, e)
+        return element_geometry(Xe)
+    end
+end
+
+# Detect whether every element is geometrically identical to element 1 *up to
+# translation* — the exact condition under which one reference set of B-matrices
+# and detJ·w is valid for all elements (SCALING.md §2.2). We compare each node's
+# offset from the element's first node against element 1's offsets; if they all
+# match, every element is a rigid translate of element 1 (same shape ⇒ same B,
+# same detJ). This is alloc-free scalar work (no per-element B/inv(J)), so it does
+# not blow the build-time memory budget at scale, and it is exact — it does not
+# weaken to merely matching detJ.
+function _is_uniform(nodes::Matrix{Float64}, elements::Matrix{Int})
+    nelem = size(elements, 2)
+    nelem <= 1 && return true
+    @inbounds begin
+        n11 = elements[1, 1]
+        L = 0.0
+        for i in 2:8, d in 1:3
+            L = max(L, abs(nodes[d, elements[i, 1]] - nodes[d, n11]))
+        end
+        tol = 1e-9 * (L + 1.0)
+        for e in 2:nelem
+            ne1 = elements[1, e]
+            for i in 2:8
+                nei = elements[i, e]; ni1 = elements[i, 1]
+                for d in 1:3
+                    off_e = nodes[d, nei] - nodes[d, ne1]
+                    off_1 = nodes[d, ni1] - nodes[d, n11]
+                    abs(off_e - off_1) > tol && return false
+                end
+            end
+        end
+    end
+    return true
 end
 
 """
     precompute_cache(nodes, elements) -> ElementCache
 
-Compute and cache B and detJ·w for every (element, gp). `nodes` is 3×nnodes,
-`elements` is 8×nelem (DESIGN §3.6, §4.4).
+Build the element-geometry cache (SCALING.md §2.2). Detects whether the mesh is a
+uniform box: if so caches a single reference element; otherwise stores the mesh
+for on-the-fly geometry recompute. `nodes` is 3×nnodes, `elements` is 8×nelem.
 """
 function precompute_cache(nodes::Matrix{Float64}, elements::Matrix{Int})
-    nelem = size(elements, 2)
-    Bvec = Vector{SVector{8,SMatrix{6,24,Float64,144}}}(undef, nelem)
-    Jwvec = Vector{SVector{8,Float64}}(undef, nelem)
-    for e in 1:nelem
-        # element node coordinates as 8×3 SMatrix
-        Xe = SMatrix{8,3,Float64,24}(ntuple(24) do k
-            a = (k - 1) % 8 + 1
-            j = (k - 1) ÷ 8 + 1
-            nodes[j, elements[a, e]]
-        end)
-        # compute B and detJ·w together (one Jacobian per Gauss point)
-        geo = ntuple(8) do g
-            ξ = GAUSS_PTS[g]
-            dN = hex8_dshape(ξ)
-            J = jacobian(Xe, dN)
-            detJ = det(J)
-            @assert detJ > 0 "non-positive detJ=$detJ in element $e (check node ordering)"
-            dNdx = dN * inv(J)
-            (bmatrix(dNdx), detJ * GAUSS_WTS[g])
-        end
-        Bvec[e] = SVector{8,SMatrix{6,24,Float64,144}}(ntuple(g -> geo[g][1], 8))
-        Jwvec[e] = SVector{8,Float64}(ntuple(g -> geo[g][2], 8))
+    uniform = _is_uniform(nodes, elements)
+    if uniform
+        Xe = element_coords(nodes, elements, 1)
+        Bref, detJwref = element_geometry(Xe)
+        @assert all(>(0), detJwref) "non-positive detJ in reference element (check node ordering)"
+        return ElementCache(true, Bref, detJwref, nodes, elements)
+    else
+        # placeholder reference set (unused when uniform=false)
+        Bz = zero(SMatrix{6,24,Float64,144})
+        Bref = SVector{8,SMatrix{6,24,Float64,144}}(ntuple(_ -> Bz, 8))
+        detJwref = zero(SVector{8,Float64})
+        return ElementCache(false, Bref, detJwref, nodes, elements)
     end
-    return ElementCache(Bvec, Jwvec)
 end
 
 """
