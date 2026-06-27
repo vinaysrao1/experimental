@@ -60,6 +60,16 @@ end
     end
     # one VTK_HEXAHEDRON (type 12) per element
     @test count(==("12"), strip.(split(txt, '\n'))) == mesh.nelem
+
+    # connectivity / offsets must match the mesh exactly (0-based, VTK ordering).
+    # This guards the writer's most dangerous silent failure: a permuted or
+    # off-by-one Hex8 ordering would distort every cell in ParaView yet pass the
+    # name/count checks above.
+    between(name) = match(Regex("Name=\"$name\"[^>]*>(.*?)</DataArray>", "s"), txt).captures[1]
+    conn = parse.(Int, split(between("connectivity")))
+    @test conn == vec(mesh.elements .- 1)                    # 8 nodes/cell, 0-based
+    offs = parse.(Int, split(between("offsets")))
+    @test offs == collect(8:8:8*mesh.nelem)
     # plastic problem ⇒ some yielding recorded in the export
     @test occursin("EqPlasticStrain", txt)
     @test maximum(equivalent_plastic_strain(model)) > 0

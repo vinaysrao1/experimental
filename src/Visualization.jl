@@ -118,8 +118,9 @@ Fields:
   6-component, with `xx,yy,zz,xy,yz,zx` component names), `VonMises`,
   `MeanStress`, and `EqPlasticStrain`.
 
-Call after `solve!` (it reads the committed stress/plastic state and the current
-displacement). Example:
+Call after a converged `solve!`: `Stress`/`EqPlasticStrain` come from the
+committed state and `Strain` is recomputed from the current displacement `U`, so
+the two agree only at a converged solution. Example:
 
     solve!(model; nsteps=20)
     write_vtu("tension_cube", model)   # -> "tension_cube.vtu", open in ParaView
