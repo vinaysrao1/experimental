@@ -10,7 +10,7 @@ using LinearAlgebra
 using ..MeshMod: GaussState
 using ..BoundaryConditions: DirichletBC, NeumannBC, impose_dirichlet!, assemble_neumann!
 using ..Assembly: assemble!
-using ..ModelMod: Model
+using ..ModelMod: Model, reset!
 
 export solve!, newton!, SolveResult
 
@@ -30,12 +30,25 @@ end
 # Dirichlet is split into ramped (prescribed) and non-ramped (fixed) sets so a
 # single `ramp` bool per DirichletBC suffices (DESIGN §4.5).
 function _freeze_bcs(model::Model)
-    rd = Int[]; rv = Float64[]; fd = Int[]; fv = Float64[]
+    # Deduplicate Dirichlet constraints per DOF (last assignment wins) so a DOF
+    # that was constrained more than once does not appear twice in the imposed
+    # system. Warn if two *conflicting* values are prescribed on the same DOF.
+    last = Dict{Int,Tuple{Float64,Bool}}()   # dof => (value, ramp)
     @inbounds for i in eachindex(model.dir_dofs)
-        if model.dir_ramp[i]
-            push!(rd, model.dir_dofs[i]); push!(rv, model.dir_vals[i])
+        d = model.dir_dofs[i]
+        v = model.dir_vals[i]
+        prev = get(last, d, nothing)
+        if prev !== nothing && prev[1] != v
+            @warn "conflicting Dirichlet values on dof $d ($(prev[1]) vs $v); using the last" maxlog=5
+        end
+        last[d] = (v, model.dir_ramp[i])
+    end
+    rd = Int[]; rv = Float64[]; fd = Int[]; fv = Float64[]
+    for (d, (v, ramp)) in last
+        if ramp
+            push!(rd, d); push!(rv, v)
         else
-            push!(fd, model.dir_dofs[i]); push!(fv, model.dir_vals[i])
+            push!(fd, d); push!(fv, v)
         end
     end
     dir_ramp = DirichletBC(rd, rv, true)
@@ -65,6 +78,16 @@ function newton!(model::Model, dir_ramp::DirichletBC, dir_fix::DirichletBC,
 
     res_hist = Float64[]
     converged = false
+    # Reference scale for a *relative* convergence test (DESIGN §6.3). The
+    # residual carries force units, so an absolute tolerance is not scale
+    # invariant — a force-controlled problem with large applied forces would
+    # never reach an absolute 1e-8 (it bottoms out at the round-off floor of the
+    # force magnitude). We set the reference from the first-iteration residual
+    # (which captures the load-increment magnitude, including the prescribed-
+    # displacement constraint contribution) and the external load norm, with a
+    # floor of 1 so a near-zero step still uses an absolute test.
+    ref = 1.0
+    fext_norm = sqrt(sum(abs2, Fext))
 
     for it in 1:maxiter
         # reset trial state from committed before recomputing (path-dependent)
@@ -88,9 +111,12 @@ function newton!(model::Model, dir_ramp::DirichletBC, dir_fix::DirichletBC,
         # not falsely "converge" at U=0). Equivalent to ‖[R_free; g−U_bc]‖.
         rnorm = sqrt(sum(abs2, R))
         push!(res_hist, rnorm)
-        verbose && println("    iter $it  |R| = $rnorm")
+        if it == 1
+            ref = max(rnorm, fext_norm, 1.0)
+        end
+        verbose && println("    iter $it  |R| = $rnorm  (tol = $(tol*ref))")
 
-        if rnorm <= tol
+        if rnorm <= tol * ref
             converged = true
             break
         end
@@ -111,6 +137,7 @@ path dependent).
 """
 function solve!(model::Model; nsteps::Int=10, tol::Float64=1e-8,
                 maxiter::Int=25, verbose::Bool=false)
+    reset!(model)   # idempotent: start from the undeformed, unhardened state
     dir_ramp, dir_fix, neu = _freeze_bcs(model)
     Fext = zeros(length(model.U))
 

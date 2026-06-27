@@ -52,6 +52,14 @@ end
 function J2Material(; E::Real, ν::Real, σy0::Real, Hiso::Real=0.0, Hkin::Real=0.0)
     E = Float64(E); ν = Float64(ν); σy0 = Float64(σy0)
     Hiso = Float64(Hiso); Hkin = Float64(Hkin)
+    # Physical-validity guards (DESIGN §4.1): a non-positive σy0 makes the
+    # zero-deviator yield normal n̂ = 0/0 = NaN propagate; negative hardening or
+    # ν ≥ 0.5 (incompressible) break the moduli.
+    E > 0 || throw(ArgumentError("E must be positive (got $E)"))
+    -1 < ν < 0.5 || throw(ArgumentError("ν must satisfy −1 < ν < 0.5 (got $ν)"))
+    σy0 > 0 || throw(ArgumentError("σy0 must be positive (got $σy0)"))
+    Hiso ≥ 0 || throw(ArgumentError("Hiso must be ≥ 0 (got $Hiso)"))
+    Hkin ≥ 0 || throw(ArgumentError("Hkin must be ≥ 0 (got $Hkin)"))
     G = E / (2 * (1 + ν))
     K = E / (3 * (1 - 2ν))
     λ = E * ν / ((1 + ν) * (1 - 2ν))

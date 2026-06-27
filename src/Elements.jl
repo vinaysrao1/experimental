@@ -134,23 +134,18 @@ function precompute_cache(nodes::Matrix{Float64}, elements::Matrix{Int})
             j = (k - 1) ÷ 8 + 1
             nodes[j, elements[a, e]]
         end)
-        Bgp = ntuple(8) do g
+        # compute B and detJ·w together (one Jacobian per Gauss point)
+        geo = ntuple(8) do g
             ξ = GAUSS_PTS[g]
             dN = hex8_dshape(ξ)
             J = jacobian(Xe, dN)
             detJ = det(J)
             @assert detJ > 0 "non-positive detJ=$detJ in element $e (check node ordering)"
             dNdx = dN * inv(J)
-            bmatrix(dNdx)
+            (bmatrix(dNdx), detJ * GAUSS_WTS[g])
         end
-        Jwgp = ntuple(8) do g
-            ξ = GAUSS_PTS[g]
-            dN = hex8_dshape(ξ)
-            J = jacobian(Xe, dN)
-            det(J) * GAUSS_WTS[g]
-        end
-        Bvec[e] = SVector{8,SMatrix{6,24,Float64,144}}(Bgp)
-        Jwvec[e] = SVector{8,Float64}(Jwgp)
+        Bvec[e] = SVector{8,SMatrix{6,24,Float64,144}}(ntuple(g -> geo[g][1], 8))
+        Jwvec[e] = SVector{8,Float64}(ntuple(g -> geo[g][2], 8))
     end
     return ElementCache(Bvec, Jwvec)
 end

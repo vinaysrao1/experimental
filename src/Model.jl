@@ -14,7 +14,7 @@ using ..Elements: ElementCache, precompute_cache
 using ..BoundaryConditions: DirichletBC, NeumannBC
 using ..Assembly: SparsityPattern, build_sparsity
 
-export Model, fix!, prescribe!, load!,
+export Model, fix!, prescribe!, load!, reset!,
        nodal_displacements, gauss_stress, equivalent_plastic_strain
 
 """
@@ -113,12 +113,22 @@ function load!(model::Model, nodes::AbstractVector{<:Integer}, comp::Symbol,
     return model
 end
 
-# Freeze accumulators into BC structs. Dirichlet ramp must be uniform per the
-# simple struct; we honor per-dof ramp by splitting into two impose passes if
-# needed — but in practice all-fixed (ramp=false) and prescribed (ramp=true)
-# coexist, so we build one combined BC and carry the ramp flag per dof.
-function _dirichlet(model::Model)
-    return (model.dir_dofs, model.dir_vals, model.dir_ramp)
+"""
+    reset!(model) -> model
+
+Return the model to its just-built state: zero the displacement solution and the
+committed/trial per-Gauss-point history (plastic strain, back stress, ᾱ, stress).
+BCs and loads are kept. `solve!` calls this on entry so that re-solving a model
+(e.g. after changing the load magnitude) starts from the undeformed, unhardened
+state rather than silently continuing to accumulate plastic strain from a
+previous solve.
+"""
+function reset!(model::Model)
+    fill!(model.U, 0.0)
+    for st in (model.state_committed, model.state_trial)
+        fill!(st.εp, 0.0); fill!(st.β, 0.0); fill!(st.ᾱ, 0.0); fill!(st.σ, 0.0)
+    end
+    return model
 end
 
 # --- postprocessing (DESIGN §6.3) ---
