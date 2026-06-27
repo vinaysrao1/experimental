@@ -439,7 +439,8 @@ end
             3 * (mesh.elements[a, e] - 1) + comp
         end
         ue = SVector{24,Float64}(ntuple(i -> U[edofs[i]], 24))
-        _, Ke = element_force_tangent!(mat, model.cache.B[e], model.cache.detJw[e],
+        Bs_e, Jw_e = PlasticityFEM.Elements.element_geometry(model.cache, e)
+        _, Ke = element_force_tangent!(mat, Bs_e, Jw_e,
                                        ue, εp, β, ᾱ, 1, σo, Val(false))
         for c in 1:24, r in 1:24
             push!(Ivec, edofs[r]); push!(Jvec, edofs[c]); push!(Vvec, Ke[r, c])
@@ -530,7 +531,7 @@ end
         mesh = box_mesh(1.0, 1.0, 1.0, 1, 1, 1)
         cache = precompute_cache(mesh.nodes, mesh.elements)
         εp = zeros(6, 8); β = zeros(6, 8); ᾱ = zeros(8); σ = zeros(6, 8)
-        B1 = cache.B[1]; Jw1 = cache.detJw[1]
+        B1, Jw1 = element_geometry(cache, 1)
         ue_el = SVector{24,Float64}(ntuple(i -> 1e-6 * i, 24))   # elastic
         ue_pl = SVector{24,Float64}(ntuple(i -> 1e-3 * i, 24))   # plastic
         # warmups (all four branches)
@@ -633,7 +634,8 @@ end
     cache = precompute_cache(mesh.nodes, mesh.elements)
     εp = zeros(6, 8); β = zeros(6, 8); ᾱ = zeros(8); σ = zeros(6, 8)
     ue = SVector{24,Float64}(ntuple(i -> 1e-3 * i, 24))
-    ft = @inferred element_force_tangent!(mat, cache.B[1], cache.detJw[1], ue,
+    Bs1, Jw1 = element_geometry(cache, 1)
+    ft = @inferred element_force_tangent!(mat, Bs1, Jw1, ue,
                                           εp, β, ᾱ, 1, σ, Val(false))
     @test ft[1] isa SVector{24,Float64}
     @test ft[2] isa SMatrix{24,24,Float64,576}

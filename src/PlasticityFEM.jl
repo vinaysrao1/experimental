@@ -38,8 +38,8 @@ export write_vtu, gauss_strain, von_mises
 export SolveResult
 
 # Re-export selected internals useful for tests / advanced use.
-export return_map, precompute_cache, element_force_tangent!,
+export return_map, precompute_cache, element_geometry, element_force_tangent!,
        build_sparsity, assemble!, GaussState, DirichletBC, NeumannBC,
-       impose_dirichlet!, dof, Mesh
+       impose_dirichlet!, dof, Mesh, LinearSolveState
 
 end # module

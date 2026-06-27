@@ -26,15 +26,16 @@ preallocated once; `U` and buffers are reassignable (DESIGN §4.6).
 BCs/loads are accumulated in growable lists by the builder API and frozen into
 `DirichletBC`/`NeumannBC` at solve time.
 """
-mutable struct Model
+mutable struct Model{Ti<:Integer}
     mesh::Mesh
     material::J2Material
     cache::ElementCache
-    sparsity::SparsityPattern
+    sparsity::SparsityPattern{Ti}
     state_committed::GaussState
     state_trial::GaussState
     Rbuf::Vector{Float64}
     U::Vector{Float64}
+    δU::Vector{Float64}             # Newton correction buffer (reused each iter)
     # BC accumulators (DOF-indexed; deduplicated at solve)
     dir_dofs::Vector{Int}
     dir_vals::Vector{Float64}
@@ -43,15 +44,23 @@ mutable struct Model
     neu_vals::Vector{Float64}
 end
 
-function Model(mesh::Mesh, material::J2Material)
+"""
+    Model(mesh, material; Ti=nothing)
+
+Build the assembled problem. `Ti` selects the sparse index type (default: `Int32`
+for large problems, else chosen by `build_sparsity`). The returned `Model` is
+parametric on the chosen index type.
+"""
+function Model(mesh::Mesh, material::J2Material; Ti::Union{Type{<:Integer},Nothing}=nothing)
     ndof = 3 * mesh.nnodes
     ngp = mesh.nelem * 8
     cache = precompute_cache(mesh.nodes, mesh.elements)
-    sparsity = build_sparsity(mesh)
-    return Model(mesh, material, cache, sparsity,
-                 GaussState(ngp), GaussState(ngp),
-                 zeros(ndof), zeros(ndof),
-                 Int[], Float64[], Bool[], Int[], Float64[])
+    sparsity = build_sparsity(mesh; Ti=Ti)
+    Tidx = eltype(sparsity.K.colptr)
+    return Model{Tidx}(mesh, material, cache, sparsity,
+                       GaussState(ngp), GaussState(ngp),
+                       zeros(ndof), zeros(ndof), zeros(ndof),
+                       Int[], Float64[], Bool[], Int[], Float64[])
 end
 
 # component symbol -> list of component indices

@@ -61,7 +61,8 @@ let
     cache = precompute_cache(mesh.nodes, mesh.elements)
     εp = zeros(6, 8); β = zeros(6, 8); ᾱ = zeros(8); σ = zeros(6, 8)
     ue = SVector{24,Float64}(ntuple(i -> 1e-3 * i, 24))
-    f() = element_force_tangent!(mat, cache.B[1], cache.detJw[1], ue, εp, β, ᾱ, 1, σ, Val(false))
+    B1, Jw1 = element_geometry(cache, 1)
+    f() = element_force_tangent!(mat, B1, Jw1, ue, εp, β, ᾱ, 1, σ, Val(false))
     t, m = bench(f)
     println("element_force_tangent! (1 elem): $(round(t, digits=1)) ns,  $m bytes")
 end

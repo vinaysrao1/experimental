@@ -13,6 +13,7 @@ module Visualization
 using StaticArrays
 using ..MeshMod: Mesh
 using ..ModelMod: Model
+using ..Elements: element_geometry
 
 export write_vtu, gauss_strain, von_mises
 
@@ -41,12 +42,12 @@ function gauss_strain(model::Model)
     mesh = model.mesh
     U = model.U
     edofs = model.sparsity.edofs
-    B = model.cache.B
     ε = Matrix{Float64}(undef, 6, mesh.nelem * 8)
     @inbounds for e in 1:mesh.nelem
         ue = SVector{24,Float64}(ntuple(i -> U[edofs[i, e]], Val(24)))
+        Bs, _ = element_geometry(model.cache, e)
         for g in 1:8
-            εg = B[e][g] * ue
+            εg = Bs[g] * ue
             gp = (e - 1) * 8 + g
             for k in 1:6
                 ε[k, gp] = εg[k]

@@ -23,4 +23,7 @@ using Test
     @testset "HardValidation" begin
         include("hard_validation.jl")
     end
+    @testset "Scaling" begin
+        include("test_scaling.jl")
+    end
 end
