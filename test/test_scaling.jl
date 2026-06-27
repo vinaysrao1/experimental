@@ -82,3 +82,60 @@ end
     # small Newton iteration count preserved under inexact CG
     @test all(length(hh) <= 8 for hh in res.residuals)
 end
+
+@testset "Phase 2: Int32 indices, nnz/N stencil bound, O(1) assemble alloc" begin
+    # Large-problem pattern uses Int32 indices (SCALING.md §2.5).
+    sp = build_sparsity(box_mesh(1.0, 1.0, 1.0, 4, 4, 4))
+    @test eltype(sp.K.rowval) == Int32
+    @test eltype(sp.K.colptr) == Int32
+
+    # nnz/N is bounded by the 81-entry interior Hex8 stencil and approaches it
+    # under refinement (boundary fraction shrinks) — i.e. nnz = O(N) with the
+    # mesh-independent constant 81 (SCALING.md §0.1, §6.3).
+    ratios = Float64[]
+    for n in (4, 8, 12)
+        spn = build_sparsity(box_mesh(1.0, 1.0, 1.0, n, n, n))
+        push!(ratios, nnz(spn.K) / size(spn.K, 1))
+    end
+    @info "Phase2 nnz/N" ratios
+    @test all(r -> r <= 81.0 + 1e-9, ratios)   # never exceeds the interior stencil
+    @test issorted(ratios)                      # grows toward 81 with refinement
+    @test ratios[end] > ratios[1]
+
+    # assemble! allocation is a bounded constant independent of nelem (the
+    # on-the-fly CSC scatter must not allocate per element — preserves T20).
+    function asm_alloc(n)
+        m = _scaling_cube(n; σy0=1e9)
+        st = m.state_trial
+        assemble!(m.sparsity, m.material, m.cache, m.U, st.εp, st.β, st.ᾱ, st.σ, m.Rbuf)
+        return @allocated assemble!(m.sparsity, m.material, m.cache, m.U,
+                                    st.εp, st.β, st.ᾱ, st.σ, m.Rbuf)
+    end
+    a4 = asm_alloc(4); a8 = asm_alloc(8)   # 64 vs 512 elements
+    @info "Phase2 assemble! alloc" a4 a8
+    @test a8 <= a4 + 1024                   # bounded constant, not O(nelem)
+end
+
+@testset "Phase 3: threaded assembly == serial; threaded SpMV == K*x" begin
+    m = _scaling_cube(6; σy0=1e9)
+    # impose a nontrivial displacement so K and R are both nonzero
+    m.U .= [1e-4 * sin(0.7 * i) for i in 1:length(m.U)]
+    st = m.state_trial
+
+    Ks, Rs = assemble!(m.sparsity, m.material, m.cache, m.U,
+                       st.εp, st.β, st.ᾱ, st.σ, m.Rbuf)
+    Ks_nz = copy(Ks.nzval); Rs_c = copy(Rs)
+
+    # threaded 8-color assembly into the same pattern — race-free, so the result
+    # must match the serial assembly to round-off (different summation order).
+    Kt, Rt = assemble_threaded!(m.sparsity, m.material, m.cache, m.U,
+                                st.εp, st.β, st.ᾱ, st.σ, m.Rbuf)
+    @info "Phase3 threaded vs serial" nthreads=Threads.nthreads() dK=norm(Kt.nzval - Ks_nz) dR=norm(Rt - Rs_c)
+    @test norm(Kt.nzval - Ks_nz) <= 1e-12 * (norm(Ks_nz) + 1)
+    @test norm(Rt - Rs_c) <= 1e-12 * (norm(Rs_c) + 1)
+
+    # row-parallel symmetric SpMV (K = Kᵀ) matches the plain sparse product
+    A = PlasticityFEM.Solver.SymThreadedK(Ks)
+    x = Float64[sin(0.3 * i) for i in 1:size(Ks, 2)]
+    @test norm(A * x - Ks * x) <= 1e-10 * norm(Ks * x)
+end

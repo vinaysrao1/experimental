@@ -19,10 +19,35 @@ using Krylov: CgWorkspace, cg!
 using AlgebraicMultigrid: smoothed_aggregation, ruge_stuben, aspreconditioner, Jacobi
 using ..MeshMod: GaussState
 using ..BoundaryConditions: DirichletBC, NeumannBC, impose_dirichlet!, assemble_neumann!
-using ..Assembly: assemble!
+using ..Assembly: assemble!, assemble_threaded!
 using ..ModelMod: Model, reset!
 
 export solve!, newton!, SolveResult, LinearSolveState
+
+# Row-parallel SpMV for a SYMMETRIC CSC matrix (SCALING.md §3.2). Because K = Kᵀ,
+# CSC column i holds exactly the entries of row i, so y[i] = Σ_{k in col i}
+# nzval[k]·x[rowval[k]] lets each thread write a disjoint y[i] — race-free, no
+# atomics. Used as the CG operator when threading is on; CG still applies the AMG
+# preconditioner built from the underlying K. Falls back to a serial loop when
+# single-threaded.
+struct SymThreadedK{Tv,Ti}
+    K::SparseMatrixCSC{Tv,Ti}
+end
+Base.eltype(::SymThreadedK{Tv}) where {Tv} = Tv
+Base.size(A::SymThreadedK, d::Integer) = size(A.K, d)
+Base.size(A::SymThreadedK) = size(A.K)
+function LinearAlgebra.mul!(y::AbstractVector, A::SymThreadedK, x::AbstractVector)
+    K = A.K; cp = K.colptr; rv = K.rowval; nz = K.nzval
+    Threads.@threads for i in 1:size(K, 2)
+        s = zero(eltype(y))
+        @inbounds for k in cp[i]:(cp[i+1] - 1)
+            s += nz[k] * x[rv[k]]
+        end
+        @inbounds y[i] = s
+    end
+    return y
+end
+Base.:*(A::SymThreadedK, x::AbstractVector) = mul!(similar(x, promote_type(eltype(A), eltype(x))), A, x)
 
 """
     SolveResult
@@ -67,6 +92,7 @@ mutable struct LinearSolveState
     ew_γ::Float64
     ew_α::Float64
     ndof::Int
+    threaded::Bool   # use row-parallel SpMV + 8-color threaded assembly
     ws::Any          # CgWorkspace{Float64,Float64,Vector{Float64}} | Nothing
     Pl::Any          # AlgebraicMultigrid.Preconditioner | Nothing
     cg_iters_hist::Vector{Int}   # rolling history for the refresh trigger
@@ -75,9 +101,10 @@ end
 function LinearSolveState(ndof::Int; method::Symbol=:cg, amg::Symbol=:sa,
                           smoother::Symbol=:gs, cg_itmax::Int=200,
                           η_min::Float64=1e-8, η_max::Float64=0.1,
-                          ew_γ::Float64=0.9, ew_α::Float64=1.5)
+                          ew_γ::Float64=0.9, ew_α::Float64=1.5,
+                          threaded::Bool=(Threads.nthreads() > 1))
     return LinearSolveState(method, amg, smoother, cg_itmax, η_min, η_max,
-                            ew_γ, ew_α, ndof, nothing, nothing, Int[])
+                            ew_γ, ew_α, ndof, threaded, nothing, nothing, Int[])
 end
 
 # Build an AMG hierarchy from K and wrap it as a (one V-cycle) preconditioner.
@@ -168,7 +195,11 @@ function _linear_solve!(δU::Vector{Float64}, K::SparseMatrixCSC, b::Vector{Floa
         ls.ws = CgWorkspace(length(b), length(b), Vector{Float64})
     end
 
-    cg!(ls.ws, K, b; M=ls.Pl, ldiv=true, atol=0.0, rtol=rtol, itmax=ls.cg_itmax)
+    # CG operator: the row-parallel symmetric SpMV wrapper when threading is on
+    # (K is symmetric after `impose_dirichlet!`), else the plain CSC matrix. The
+    # AMG preconditioner is always built from the underlying sparse K.
+    A = ls.threaded ? SymThreadedK(K) : K
+    cg!(ls.ws, A, b; M=ls.Pl, ldiv=true, atol=0.0, rtol=rtol, itmax=ls.cg_itmax)
     stats = ls.ws.stats
     niter = stats.niter
 
@@ -176,7 +207,7 @@ function _linear_solve!(δU::Vector{Float64}, K::SparseMatrixCSC, b::Vector{Floa
     # and retry once if CG failed to converge (stall / itmax hit).
     if !stats.solved
         ls.Pl = _build_amg(K, ls.amg, ls.smoother)
-        cg!(ls.ws, K, b; M=ls.Pl, ldiv=true, atol=0.0, rtol=rtol, itmax=ls.cg_itmax)
+        cg!(ls.ws, A, b; M=ls.Pl, ldiv=true, atol=0.0, rtol=rtol, itmax=ls.cg_itmax)
         stats = ls.ws.stats
         niter += stats.niter
         if !stats.solved
@@ -187,6 +218,19 @@ function _linear_solve!(δU::Vector{Float64}, K::SparseMatrixCSC, b::Vector{Floa
     end
     copyto!(δU, ls.ws.x)
     return niter
+end
+
+# Assemble K and F_int, choosing the race-free 8-color threaded path when enabled
+# (SCALING.md §3.1); otherwise the serial assembler. Same result either way.
+@inline function _assemble_KR!(model::Model, U::Vector{Float64}, st::GaussState,
+                               R::Vector{Float64}, threaded::Bool, commit::Bool)
+    if threaded
+        return assemble_threaded!(model.sparsity, model.material, model.cache, U,
+                                  st.εp, st.β, st.ᾱ, st.σ, R; commit=commit)
+    else
+        return assemble!(model.sparsity, model.material, model.cache, U,
+                         st.εp, st.β, st.ᾱ, st.σ, R; commit=commit)
+    end
 end
 
 """
@@ -229,8 +273,7 @@ function newton!(model::Model, dir_ramp::DirichletBC, dir_fix::DirichletBC,
         copyto!(model.state_trial, model.state_committed)
 
         # assemble F_int (into R) and K (into sparsity.nzval)
-        K, _ = assemble!(model.sparsity, model.material, model.cache, U,
-                         st.εp, st.β, st.ᾱ, st.σ, R; commit=false)
+        K, _ = _assemble_KR!(model, U, st, R, ls.threaded, false)
         # residual R = F_int − F_ext
         @inbounds @. R = R - Fext
 
@@ -287,16 +330,18 @@ Linear-solver keywords (SCALING.md §1):
 - `amg` — `:sa` smoothed aggregation (default) or `:rs` Ruge–Stüben.
 - `smoother` — `:gs` Gauss–Seidel (AMG default) or `:jacobi` (thread-parallel).
 - `cg_itmax` — inner CG iteration cap (default 200).
+- `threaded` — 8-color threaded assembly + row-parallel SpMV (default: on when
+  `Threads.nthreads() > 1`). Results are identical to the serial path.
 """
 function solve!(model::Model; nsteps::Int=10, tol::Float64=1e-8,
                 maxiter::Int=25, verbose::Bool=false,
                 linsolve::Symbol=:cg, amg::Symbol=:sa, smoother::Symbol=:gs,
-                cg_itmax::Int=200)
+                cg_itmax::Int=200, threaded::Bool=(Threads.nthreads() > 1))
     reset!(model)   # idempotent: start from the undeformed, unhardened state
     dir_ramp, dir_fix, neu = _freeze_bcs(model)
     Fext = zeros(length(model.U))
     ls = LinearSolveState(length(model.U); method=linsolve, amg=amg,
-                          smoother=smoother, cg_itmax=cg_itmax)
+                          smoother=smoother, cg_itmax=cg_itmax, threaded=threaded)
 
     iters = Int[]
     residuals = Vector{Float64}[]
@@ -318,9 +363,7 @@ function solve!(model::Model; nsteps::Int=10, tol::Float64=1e-8,
         end
         # commit: re-run assembly once with commit=true to write GP state,
         # then copy trial → committed (DESIGN §9 commit semantics).
-        assemble!(model.sparsity, model.material, model.cache, model.U,
-                  model.state_trial.εp, model.state_trial.β, model.state_trial.ᾱ,
-                  model.state_trial.σ, model.Rbuf; commit=true)
+        _assemble_KR!(model, model.U, model.state_trial, model.Rbuf, ls.threaded, true)
         copyto!(model.state_committed, model.state_trial)
     end
 
