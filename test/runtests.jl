@@ -17,4 +17,7 @@ using Test
     @testset "Allocations" begin
         include("test_allocations.jl")
     end
+    @testset "HardValidation" begin
+        include("hard_validation.jl")
+    end
 end

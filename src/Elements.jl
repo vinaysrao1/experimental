@@ -70,10 +70,13 @@ end
 """
     jacobian(Xe, dN) -> SMatrix{3,3}
 
-Isoparametric Jacobian J_ij = Σ_a ∂N_a/∂ξ_i X_a,j = (dN)ᵀ Xe (DESIGN §3.3).
-`Xe` is the 8×3 matrix of element node coordinates.
+Isoparametric Jacobian J_ij = ∂x_i/∂ξ_j = Σ_a X_a,i ∂N_a/∂ξ_j = Xeᵀ dN
+(DESIGN §3.3). `Xe` is the 8×3 matrix of element node coordinates. The spatial
+gradients are then `dN/dx = dN · J⁻¹`. (`detJ` is invariant to this transpose,
+so axis-aligned box meshes — diagonal J — are unaffected; the transpose only
+matters for sheared/distorted elements.)
 """
-@inline jacobian(Xe::SMatrix{8,3,Float64,24}, dN::SMatrix{8,3,Float64,24}) = dN' * Xe
+@inline jacobian(Xe::SMatrix{8,3,Float64,24}, dN::SMatrix{8,3,Float64,24}) = Xe' * dN
 
 """
     bmatrix(dNdx) -> SMatrix{6,24}
