@@ -1,0 +1,20 @@
+using PlasticityFEM
+using Test
+
+@testset "PlasticityFEM" begin
+    @testset "Materials" begin
+        include("test_material.jl")
+    end
+    @testset "Elements" begin
+        include("test_element.jl")
+    end
+    @testset "Assembly" begin
+        include("test_assembly.jl")
+    end
+    @testset "Solver" begin
+        include("test_solver.jl")
+    end
+    @testset "Allocations" begin
+        include("test_allocations.jl")
+    end
+end
