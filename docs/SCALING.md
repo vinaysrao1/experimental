@@ -813,3 +813,38 @@ The design keeps new structs minimal (`ElementCache` and `SparsityPattern` shrin
 rather than grow), reuses the physics kernels verbatim, leaves the v1 small-problem
 API and Dirichlet handling intact, and fits 10M DOFs in ~30–36 GB of a 64 GB node
 with provably `O(N)` work per load step under CG+AMG.
+
+---
+
+## 9. Implementation revisions (driven by validation)
+
+Two changes to §1–§5 were forced by measured behaviour during implementation/review
+and are reflected in the code:
+
+1. **Rigid-body near-null-space is mandatory, not optional (revises §4, R1).**
+   Default smoothed-aggregation AMG *without* the near-null-space gives a CG
+   iteration count growing ~`N^0.3` (measured 24→33→44→54 over N≈2.2k→28k) — i.e.
+   `O(N^1.3)` flops, not `O(N)`. Supplying the 6 rigid-body modes (3 translations +
+   3 rotations) as the SA near-null-space flattens it to ~`N^0.09` (measured
+   8→9→10→11). The solver now *always* builds this near-null-space for `amg=:sa`
+   (`_rigid_body_modes`), so flat-iteration `O(N)` is achieved by default. A test
+   (`test_scaling.jl` "C2 mesh-independent CG count") asserts the log-log slope
+   ≤ 0.15 and gates this.
+
+2. **Default index type is `Int` (Int64), not `Int32` (revises §2.5, §5).**
+   AlgebraicMultigrid's SA-with-near-null-space (and Ruge–Stüben) build Int64
+   prolongation operators and cannot form an Int32 hierarchy. An Int32 K would
+   therefore force a *retained* Int64 copy for AMG — `~10 GB (Int32 K) + ~13 GB
+   (Int64 AMG copy)` — whereas one shared Int64 K is `~13.4 GB`. Int64 is thus both
+   simpler and ~10 GB leaner once the (required) near-null-space is in play. The
+   ~3.3 GB the Int32 micro-optimization saved is moot. Updated steady-state budget:
+   **K ≈ 13.4 GB**, total **≈ 33–39 GB** at 10M — still well under 64 GB. `Int32`
+   remains forceable via `build_sparsity(mesh; Ti=Int32)` for the `:direct`/`:rs`/
+   Jacobi paths.
+
+3. **`_is_uniform` made allocation-free (revises §2.2 build cost).** The uniformity
+   check must not compute per-element B-matrices: doing so allocated ~87 kB/element
+   (~295 GB transient at 10M, an OOM at `Model` construction). It now compares each
+   element's node offsets against element 1's with scalar arithmetic — alloc-free
+   and exact ("identical up to translation"), so build-time allocation is a small
+   constant (~87 kB total).

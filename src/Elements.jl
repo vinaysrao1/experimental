@@ -118,16 +118,18 @@ it can be reused for both the cached reference element and the on-the-fly fallba
 (SCALING.md §2.2).
 """
 @inline function element_geometry(Xe::SMatrix{8,3,Float64,24})
-    geo = ntuple(8) do g
-        ξ = GAUSS_PTS[g]
-        dN = hex8_dshape(ξ)
+    # `Val(8)` makes the tuple length a compile-time constant so `ntuple` fully
+    # unrolls and the per-GP `geo` tuple stays on the stack — keeping this kernel
+    # allocation-free (a plain `ntuple(_, 8)` here heap-allocates ~87 kB/call,
+    # which would blow both the build-time uniformity scan and the non-uniform
+    # assembly memory budget at scale).
+    geo = ntuple(Val(8)) do g
+        dN = hex8_dshape(GAUSS_PTS[g])
         J = jacobian(Xe, dN)
-        detJ = det(J)
-        dNdx = dN * inv(J)
-        (bmatrix(dNdx), detJ * GAUSS_WTS[g])
+        (bmatrix(dN * inv(J)), det(J) * GAUSS_WTS[g])
     end
-    Bs = SVector{8,SMatrix{6,24,Float64,144}}(ntuple(g -> geo[g][1], 8))
-    detJw = SVector{8,Float64}(ntuple(g -> geo[g][2], 8))
+    Bs = SVector{8,SMatrix{6,24,Float64,144}}(ntuple(g -> geo[g][1], Val(8)))
+    detJw = SVector{8,Float64}(ntuple(g -> geo[g][2], Val(8)))
     return Bs, detJw
 end
 
@@ -179,21 +181,34 @@ the hot assembly loop (SCALING.md §2.2).
     end
 end
 
-# Detect whether a box-style mesh is geometrically uniform: every element has the
-# same edge-length triple (axis-aligned, identical shape up to translation). For
-# `box_mesh` this is always true; a defensive numeric check keeps the fallback
-# correct for any hand-built non-uniform mesh.
+# Detect whether every element is geometrically identical to element 1 *up to
+# translation* — the exact condition under which one reference set of B-matrices
+# and detJ·w is valid for all elements (SCALING.md §2.2). We compare each node's
+# offset from the element's first node against element 1's offsets; if they all
+# match, every element is a rigid translate of element 1 (same shape ⇒ same B,
+# same detJ). This is alloc-free scalar work (no per-element B/inv(J)), so it does
+# not blow the build-time memory budget at scale, and it is exact — it does not
+# weaken to merely matching detJ.
 function _is_uniform(nodes::Matrix{Float64}, elements::Matrix{Int})
     nelem = size(elements, 2)
-    nelem == 0 && return true
-    Xe1 = element_coords(nodes, elements, 1)
-    B1, Jw1 = element_geometry(Xe1)
-    tol = 1e-9 * (sum(abs, Jw1) + 1.0)
-    @inbounds for e in 2:nelem
-        Xe = element_coords(nodes, elements, e)
-        _, Jw = element_geometry(Xe)
-        for g in 1:8
-            abs(Jw[g] - Jw1[g]) > tol && return false
+    nelem <= 1 && return true
+    @inbounds begin
+        n11 = elements[1, 1]
+        L = 0.0
+        for i in 2:8, d in 1:3
+            L = max(L, abs(nodes[d, elements[i, 1]] - nodes[d, n11]))
+        end
+        tol = 1e-9 * (L + 1.0)
+        for e in 2:nelem
+            ne1 = elements[1, e]
+            for i in 2:8
+                nei = elements[i, e]; ni1 = elements[i, 1]
+                for d in 1:3
+                    off_e = nodes[d, nei] - nodes[d, ne1]
+                    off_1 = nodes[d, ni1] - nodes[d, n11]
+                    abs(off_e - off_1) > tol && return false
+                end
+            end
         end
     end
     return true

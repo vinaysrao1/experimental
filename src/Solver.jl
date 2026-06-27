@@ -93,6 +93,7 @@ mutable struct LinearSolveState
     ew_α::Float64
     ndof::Int
     threaded::Bool   # use row-parallel SpMV + 8-color threaded assembly
+    nullspace::Union{Matrix{Float64},Nothing}  # rigid-body modes for SA-AMG (R1)
     ws::Any          # CgWorkspace{Float64,Float64,Vector{Float64}} | Nothing
     Pl::Any          # AlgebraicMultigrid.Preconditioner | Nothing
     cg_iters_hist::Vector{Int}   # rolling history for the refresh trigger
@@ -102,29 +103,51 @@ function LinearSolveState(ndof::Int; method::Symbol=:cg, amg::Symbol=:sa,
                           smoother::Symbol=:gs, cg_itmax::Int=200,
                           η_min::Float64=1e-8, η_max::Float64=0.1,
                           ew_γ::Float64=0.9, ew_α::Float64=1.5,
-                          threaded::Bool=(Threads.nthreads() > 1))
+                          threaded::Bool=(Threads.nthreads() > 1),
+                          nullspace::Union{Matrix{Float64},Nothing}=nothing)
     return LinearSolveState(method, amg, smoother, cg_itmax, η_min, η_max,
-                            ew_γ, ew_α, ndof, threaded, nothing, nothing, Int[])
+                            ew_γ, ew_α, ndof, threaded, nullspace, nothing, nothing, Int[])
+end
+
+# Rigid-body near-null-space (6 modes: 3 translations + 3 rotations) of the
+# 3-DOF-per-node elasticity operator, as columns of an ndof×6 matrix. Supplying
+# these to smoothed-aggregation AMG flattens the CG iteration count from ~N^0.3 to
+# ~constant (SCALING.md §1.3 R1) — the difference between O(N^1.3) and O(N) flops.
+function _rigid_body_modes(nodes::Matrix{Float64})
+    nn = size(nodes, 2)
+    B = zeros(3 * nn, 6)
+    @inbounds for n in 1:nn
+        x = nodes[1, n]; y = nodes[2, n]; z = nodes[3, n]
+        ix = 3 * (n - 1) + 1; iy = ix + 1; iz = ix + 2
+        B[ix, 1] = 1.0; B[iy, 2] = 1.0; B[iz, 3] = 1.0   # translations
+        B[iy, 4] = -z;  B[iz, 4] = y                      # rotation about x
+        B[ix, 5] = z;   B[iz, 5] = -x                     # rotation about y
+        B[ix, 6] = -y;  B[iy, 6] = x                      # rotation about z
+    end
+    return B
 end
 
 # Build an AMG hierarchy from K and wrap it as a (one V-cycle) preconditioner.
-# Smoothed aggregation is the default for 3D vector elasticity; Ruge–Stüben is
-# the documented fallback switch (SCALING.md §1.2). A Jacobi smoother (fully
-# thread-parallel) is selectable; the AMG default is symmetric Gauss–Seidel.
-function _build_amg(K::SparseMatrixCSC, amg::Symbol, smoother::Symbol)
-    # AlgebraicMultigrid's classical Ruge–Stüben coarsening currently mishandles
-    # Int32-indexed matrices (rs_direct_interpolation_pass2 assumes Int work
-    # vectors), so build the RS hierarchy from an Int64-indexed copy. This is
-    # safe: the preconditioner only maps residual→correction *vectors*, so its
-    # internal index type is independent of the operator K that CG multiplies by.
-    # Smoothed aggregation handles Int32 directly (no copy needed).
-    Krs = amg === :rs ? SparseMatrixCSC{eltype(K),Int}(K) : K
-    if smoother === :jacobi
-        sm = Jacobi(2.0 / 3.0; iter=1)
-        ml = amg === :rs ? ruge_stuben(Krs; presmoother=sm, postsmoother=sm) :
-                           smoothed_aggregation(K; presmoother=sm, postsmoother=sm)
+# Smoothed aggregation (default) uses the rigid-body near-null-space `ls.nullspace`
+# when present, which flattens the CG iteration count for 3D vector elasticity
+# (SCALING.md §1.3 R1). Ruge–Stüben is the documented fallback. A Jacobi smoother
+# (fully thread-parallel) is selectable; the AMG default is symmetric Gauss–Seidel.
+function _build_amg(K::SparseMatrixCSC, ls::LinearSolveState)
+    amg = ls.amg; B = ls.nullspace
+    sm = ls.smoother === :jacobi ? Jacobi(2.0 / 3.0; iter=1) : nothing
+    if amg === :rs
+        # AlgebraicMultigrid's Ruge–Stüben needs Int-indexed input (its Int32
+        # path is broken); copy only if K is not already Int-indexed.
+        Krs = eltype(K.colptr) === Int ? K : SparseMatrixCSC{eltype(K),Int}(K)
+        ml = sm === nothing ? ruge_stuben(Krs) : ruge_stuben(Krs; presmoother=sm, postsmoother=sm)
+    elseif B !== nothing
+        # SA with a near-null-space builds Int64 prolongators, so K must be
+        # Int-indexed (build_sparsity defaults to Int for exactly this reason).
+        ml = sm === nothing ? smoothed_aggregation(K; B=B) :
+                              smoothed_aggregation(K; B=B, presmoother=sm, postsmoother=sm)
     else
-        ml = amg === :rs ? ruge_stuben(Krs) : smoothed_aggregation(K)
+        ml = sm === nothing ? smoothed_aggregation(K) :
+                              smoothed_aggregation(K; presmoother=sm, postsmoother=sm)
     end
     return aspreconditioner(ml)
 end
@@ -189,7 +212,7 @@ function _linear_solve!(δU::Vector{Float64}, K::SparseMatrixCSC, b::Vector{Floa
 
     # (re)build AMG preconditioner per the reuse policy
     if rebuild_pc || ls.Pl === nothing
-        ls.Pl = _build_amg(K, ls.amg, ls.smoother)
+        ls.Pl = _build_amg(K, ls)
     end
     if ls.ws === nothing || ls.ws.n != length(b)
         ls.ws = CgWorkspace(length(b), length(b), Vector{Float64})
@@ -206,7 +229,7 @@ function _linear_solve!(δU::Vector{Float64}, K::SparseMatrixCSC, b::Vector{Floa
     # Fallback 1 (SCALING.md §1.7): refresh the preconditioner from the current K
     # and retry once if CG failed to converge (stall / itmax hit).
     if !stats.solved
-        ls.Pl = _build_amg(K, ls.amg, ls.smoother)
+        ls.Pl = _build_amg(K, ls)
         cg!(ls.ws, A, b; M=ls.Pl, ldiv=true, atol=0.0, rtol=rtol, itmax=ls.cg_itmax)
         stats = ls.ws.stats
         niter += stats.niter
@@ -340,8 +363,11 @@ function solve!(model::Model; nsteps::Int=10, tol::Float64=1e-8,
     reset!(model)   # idempotent: start from the undeformed, unhardened state
     dir_ramp, dir_fix, neu = _freeze_bcs(model)
     Fext = zeros(length(model.U))
+    # rigid-body near-null-space for smoothed-aggregation AMG (flattens CG iters)
+    nullspace = (linsolve === :cg && amg === :sa) ? _rigid_body_modes(model.mesh.nodes) : nothing
     ls = LinearSolveState(length(model.U); method=linsolve, amg=amg,
-                          smoother=smoother, cg_itmax=cg_itmax, threaded=threaded)
+                          smoother=smoother, cg_itmax=cg_itmax, threaded=threaded,
+                          nullspace=nullspace)
 
     iters = Int[]
     residuals = Vector{Float64}[]

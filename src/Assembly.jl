@@ -86,9 +86,13 @@ Build the global CSC skeleton (zero values) by count-then-fill from node
 adjacency (SCALING.md §2.4) — no COO triplet array is ever allocated. Also builds
 the element DOF map and the 8-color element partition.
 
-The index type `Ti` defaults to `Int32` when `nnz < typemax(Int32)` (the
-large-problem path; saves memory), else falls back to `Int64` with a warning.
-Pass `Ti` explicitly to force a choice.
+The index type `Ti` defaults to `Int` (Int64). Int32 indices would save ~3.3 GB
+at 10M, but the smoothed-aggregation AMG preconditioner with a near-null-space
+(the rigid-body modes that flatten the CG iteration count — SCALING.md §1.3, R1)
+builds Int64 prolongation operators internally and cannot form an Int32 hierarchy,
+so an Int32 K would force a retained Int64 copy for AMG (net *more* memory). One
+shared Int64 K is the leaner, simpler choice. Pass `Ti=Int32` to force Int32 (only
+sound with `amg=:rs` via an internal copy, or the `:direct`/Jacobi paths).
 """
 function build_sparsity(mesh::Mesh; Ti::Union{Type{<:Integer},Nothing}=nothing)
     ndof = 3 * mesh.nnodes
@@ -104,15 +108,7 @@ function build_sparsity(mesh::Mesh; Ti::Union{Type{<:Integer},Nothing}=nothing)
     end
     nnz_total *= 3   # three columns per node share the same nnz count
 
-    # choose index type
-    Tidx = if Ti !== nothing
-        Ti
-    elseif nnz_total < typemax(Int32) && ndof < typemax(Int32)
-        Int32
-    else
-        @warn "nnz=$nnz_total ≥ typemax(Int32); falling back to Int64 indices" maxlog=1
-        Int64
-    end
+    Tidx = Ti === nothing ? Int : Ti
 
     colptr = Vector{Tidx}(undef, ndof + 1)
     rowval = Vector{Tidx}(undef, nnz_total)

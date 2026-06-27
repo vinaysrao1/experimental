@@ -83,11 +83,35 @@ end
     @test all(length(hh) <= 8 for hh in res.residuals)
 end
 
-@testset "Phase 2: Int32 indices, nnz/N stencil bound, O(1) assemble alloc" begin
-    # Large-problem pattern uses Int32 indices (SCALING.md §2.5).
+@testset "C2 mesh-independent CG count (near-null-space SA-AMG)" begin
+    # THE decisive O(N)-flops check (SCALING.md §4, §6.3): with the rigid-body
+    # near-null-space, the CG iteration count must be ~flat in N. Without it,
+    # scalar SA-AMG grows ~N^0.3 (→ O(N^1.3)). We sweep elastic cubes and fit the
+    # max CG-iters-per-Newton-step vs N in log-log; the exponent must be small.
+    Ns = Int[]; maxcg = Int[]
+    for n in (8, 12, 16, 20)
+        m = _scaling_cube(n; σy0=1e9, εtarget=1e-3)   # elastic ⇒ clean CG counts
+        res = solve!(m; nsteps=1, tol=1e-9, linsolve=:cg, amg=:sa, threaded=false)
+        push!(Ns, 3 * m.mesh.nnodes)
+        push!(maxcg, maximum(res.cg_iters[1]))
+    end
+    # log-log slope of max_cg vs N
+    lx = log.(Ns); ly = log.(maxcg)
+    x̄ = sum(lx)/length(lx); ȳ = sum(ly)/length(ly)
+    slope = sum((lx .- x̄) .* (ly .- ȳ)) / sum((lx .- x̄).^2)
+    @info "C2 CG-iter scaling" Ns maxcg slope
+    @test slope <= 0.15            # ~flat: near-null-space delivers O(N) flops
+    @test maximum(maxcg) <= 25     # absolute sanity: few iterations at every size
+end
+
+@testset "Phase 2: index type, nnz/N stencil bound, O(1) assemble alloc" begin
+    # Default index type is Int (Int64): the SA-AMG near-null-space preconditioner
+    # needs Int64 hierarchies, so one shared Int64 K is leaner than Int32+copy
+    # (SCALING.md §2.5). Int32 remains forceable via the Ti kwarg.
     sp = build_sparsity(box_mesh(1.0, 1.0, 1.0, 4, 4, 4))
-    @test eltype(sp.K.rowval) == Int32
-    @test eltype(sp.K.colptr) == Int32
+    @test eltype(sp.K.rowval) == Int
+    @test eltype(sp.K.colptr) == Int
+    @test eltype(build_sparsity(box_mesh(1.0,1.0,1.0,2,2,2); Ti=Int32).K.rowval) == Int32
 
     # nnz/N is bounded by the 81-entry interior Hex8 stencil and approaches it
     # under refinement (boundary fraction shrinks) — i.e. nnz = O(N) with the
