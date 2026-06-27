@@ -29,7 +29,7 @@ using .Solver
 # --- curated public exports (DESIGN §5.1) ---
 export box_mesh, on_face, select_nodes
 export J2Material
-export Model, fix!, prescribe!, load!, solve!
+export Model, fix!, prescribe!, load!, solve!, reset!
 export nodal_displacements, gauss_stress, equivalent_plastic_strain
 export SolveResult
 
