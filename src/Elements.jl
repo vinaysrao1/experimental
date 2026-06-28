@@ -11,8 +11,8 @@ using StaticArrays
 using LinearAlgebra
 using ..Materials: J2Material, return_map
 using ..FiniteStrain: FiniteStrain, ElementKind, Hex8Small, Hex8Finite, Hex8FiniteFbar,
-    deformation_gradient, finite_kinematics, finite_stress_update, spatial_modulus,
-    voigt_to_sym3, sym3_to_voigt, dPdF, first_piola, dtau_dbeta
+    deformation_gradient, finite_kinematics, finite_stress_update,
+    voigt_to_sym3, sym3_to_voigt, dPdF, first_piola, dtau_dbeta, ElementInversionError
 
 export hex8_shape, hex8_dshape, jacobian, bmatrix, precompute_cache,
        element_force_tangent!, element_force_tangent_finite!, geometric_stiffness,
@@ -440,6 +440,11 @@ updated plastic history (εp, β, ᾱ, Cp_inv) is written back. Allocation-free.
         Cpi_n = SVector{6,Float64}(Cp_inv[1, idx], Cp_inv[2, idx], Cp_inv[3, idx],
                                    Cp_inv[4, idx], Cp_inv[5, idx], Cp_inv[6, idx])
         kin = finite_kinematics(Fbar, Cpi_n)
+        # Fail LOUDLY on an inverted element (J = det F ≤ 0): the log-strain update
+        # is ill-defined there and would otherwise silently return zero stress and a
+        # wrong tangent (kin carries placeholder Finv=I, εe_tr=0). The solver has no
+        # step-cutting, so throw a clear typed error (FiniteStrain.ElementInversionError).
+        kin.ok || throw(ElementInversionError(e, g, kin.J))
         εp_n = SVector{6,Float64}(εp[1, idx], εp[2, idx], εp[3, idx],
                                   εp[4, idx], εp[5, idx], εp[6, idx])
         β_n = SVector{6,Float64}(β[1, idx], β[2, idx], β[3, idx],

@@ -27,7 +27,29 @@ using ..Materials: J2Material, return_map
 export ElementKind, Hex8Small, Hex8Finite, Hex8FiniteFbar
 export deformation_gradient, finite_kinematics, finite_stress_update,
        spatial_modulus, sym3_to_voigt, voigt_to_sym3, det_Fp_from_Cpinv,
-       dPdF, first_piola, polar_RU, dR_polar, dtau_dbeta
+       dPdF, first_piola, polar_RU, dR_polar, dtau_dbeta, ElementInversionError
+
+"""
+    ElementInversionError(e, g, J) <: Exception
+
+Thrown when an element's deformation gradient has det F = J ≤ 0 at element index
+`e`, Gauss point `g` (a folded / inverted configuration). J ≤ 0 makes the
+spectral log-strain decomposition (½ ln bᵉ_tr) ill-defined, so continuing would
+silently produce garbage (zero stress, wrong tangent). The solver has no
+step-cutting machinery, so this is raised as a clear, typed failure rather than
+swallowed. Carries the offending element/GP indices and J for diagnosis.
+"""
+struct ElementInversionError <: Exception
+    e::Int
+    g::Int
+    J::Float64
+end
+
+function Base.showerror(io::IO, err::ElementInversionError)
+    print(io, "ElementInversionError: element $(err.e), Gauss point $(err.g) ",
+          "is inverted (det F = J = $(err.J) ≤ 0). The log-strain stress update ",
+          "requires J > 0; reduce the load step or fix the mesh/BCs.")
+end
 
 # --- element-kind dispatch seam (FINITE_STRAIN §6.1) ---
 
@@ -464,8 +486,7 @@ end
     SVector{6,Float64}(S[1, 1], S[2, 2], S[3, 3], 2S[1, 2], 2S[2, 3], 2S[1, 3])
 
 """
-    dPdF(mat, kin, Cp_inv_n, D, τ_voigt, F; β_ref, β_sp, R, U, ᾱ_n, dtdb)
-        -> SMatrix{9,9}
+    dPdF(kin, Cp_inv_n, D, τ_voigt, F; β_ref, R, U, dtdb) -> SMatrix{9,9}
 
 First Piola–Kirchhoff tangent A = ∂P/∂F (FINITE_STRAIN §4.5/§4.6), P = τ·F⁻ᵀ.
 Built by analytic differentiation: ∂be/∂F (be = F·Cᵖ⁻¹·Fᵀ), ∂εᵉ/∂F via the

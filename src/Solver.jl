@@ -217,6 +217,18 @@ function _freeze_bcs(model::Model)
     return dir_ramp, dir_fix, neu
 end
 
+# Classify a CG error: true iff it is the non-SPD / "positive definite" failure
+# `cg!` raises on a non-symmetric / indefinite tangent (the only case for which a
+# direct fallback is the right recovery). InterruptException (Ctrl-C) and genuine
+# CG misconfiguration errors are NOT this and must propagate (S1). We match on the
+# rendered message because Krylov surfaces this as a plain error type.
+function _is_non_spd_error(err::Exception)
+    err isa InterruptException && return false
+    msg = sprint(showerror, err)
+    return occursin("positive definite", msg) || occursin("not symmetric", msg) ||
+           occursin("indefinite", msg)
+end
+
 # Solve K δU = b into δU. CG+AMG by default, with a refresh-on-stall fallback;
 # `:direct` uses UMFPACK. Returns the number of CG iterations (0 for direct).
 # `rebuild_pc` forces an AMG rebuild before solving (start of a load step).
@@ -245,6 +257,7 @@ function _linear_solve!(δU::Vector{Float64}, K::SparseMatrixCSC, b::Vector{Floa
     try
         cg!(ls.ws, A, b; M=ls.Pl, ldiv=true, atol=0.0, rtol=rtol, itmax=ls.cg_itmax)
     catch err
+        _is_non_spd_error(err) || rethrow()
         @warn "CG raised $(typeof(err)) ($(sprint(showerror, err))); falling back to direct solve" maxlog=5
         δU .= K \ b
         return 0
@@ -259,6 +272,7 @@ function _linear_solve!(δU::Vector{Float64}, K::SparseMatrixCSC, b::Vector{Floa
         try
             cg!(ls.ws, A, b; M=ls.Pl, ldiv=true, atol=0.0, rtol=rtol, itmax=ls.cg_itmax)
         catch err
+            _is_non_spd_error(err) || rethrow()
             @warn "CG raised $(typeof(err)) on retry ($(sprint(showerror, err))); falling back to direct solve" maxlog=5
             δU .= K \ b
             return niter

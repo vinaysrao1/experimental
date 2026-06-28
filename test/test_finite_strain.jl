@@ -222,9 +222,11 @@ end
     end
 end
 
-@testset "F5 frame-indifference under cyclic simple shear (no drift)" begin
-    # Drive simple shear up and back to zero; with an elastic round-trip the
-    # stress must return to ~zero (no spurious oscillation / energy drift).
+@testset "F5 elastic cyclic-shear round-trip (no drift)" begin
+    # Drive simple shear up and back to zero with σy huge ⇒ purely ELASTIC. The
+    # round-trip stress must return to ~zero (no spurious oscillation / drift).
+    # This is an elastic reversibility check (the label, not the math, was the
+    # earlier overstatement — a genuinely plastic version is F5b below).
     mat = J2Material(E=210e3, ν=0.3, σy0=1e9)   # σy huge ⇒ stays elastic
     Z6 = zero(SVector{6,Float64}); I6 = SVector{6,Float64}(1, 1, 1, 0, 0, 0)
     γs = vcat(range(0, 0.3; length=8), range(0.3, 0.0; length=8))
@@ -235,6 +237,34 @@ end
         τend, _, _, _, _, _, _ = FS.finite_stress_update(mat, kin, F, Z6, Z6, 0.0)
     end
     @test norm(τend) < 1e-6 * mat.E           # returns to ~zero stress
+end
+
+@testset "F5b plastic cyclic-shear no spurious drift" begin
+    # Genuinely PLASTIC cyclic simple shear (γ: 0→+γ→0→−γ→0) with isotropic
+    # hardening. The path is committed step by step (path-dependent). On returning
+    # to γ=0 the deviatoric Kirchhoff stress must be bounded by the current yield
+    # surface (no runaway / spurious oscillatory drift) and the accumulated plastic
+    # strain must grow monotonically (physical dissipation).
+    mat = J2Material(E=210e3, ν=0.3, σy0=250.0, Hiso=1000.0)
+    Z6 = zero(SVector{6,Float64}); I6 = SVector{6,Float64}(1, 1, 1, 0, 0, 0)
+    γs = vcat(range(0, 0.05; length=6)[2:end], range(0.05, 0.0; length=6)[2:end],
+              range(0.0, -0.05; length=6)[2:end], range(-0.05, 0.0; length=6)[2:end])
+    εp = Z6; βr = Z6; ᾱ = 0.0; Cpi = I6
+    ᾱ_prev = 0.0; τ_at_zero = nothing
+    for γ in γs
+        F = SMatrix{3,3,Float64,9}(1, 0, 0, γ, 1, 0, 0, 0, 1)
+        kin = FS.finite_kinematics(F, Cpi)
+        τ, εp, βr, ᾱ, _, _, Cpi = FS.finite_stress_update(mat, kin, F, εp, βr, ᾱ)
+        @test ᾱ >= ᾱ_prev - 1e-12             # plastic strain never decreases
+        ᾱ_prev = ᾱ
+        τ_at_zero = τ
+    end
+    @test ᾱ > 0.0                              # genuinely plastic
+    # at the final γ=0 the deviatoric stress is bounded by the current yield stress.
+    p = (τ_at_zero[1] + τ_at_zero[2] + τ_at_zero[3]) / 3
+    s = τ_at_zero - SVector{6,Float64}(p, p, p, 0, 0, 0)
+    seq = sqrt(1.5 * (s[1]^2 + s[2]^2 + s[3]^2 + 2 * (s[4]^2 + s[5]^2 + s[6]^2)))
+    @test seq <= mat.σy0 + mat.Hiso * ᾱ + 1e-6 * mat.E
 end
 
 @testset "F6/F7 F-bar relieves volumetric locking" begin
@@ -382,6 +412,34 @@ end
     a2 = asm(2); a3 = asm(3)
     # bounded by a small constant independent of nelem (allow modest overhead)
     @test a3 <= a2 + 2048
+end
+
+@testset "F13 inverted element fails LOUDLY (not silent zero stress)" begin
+    # R1 regression: an inverted (det F = J ≤ 0) configuration must throw a clear
+    # typed ElementInversionError, NOT silently return zero stress / a wrong tangent.
+    _, dNdXs, detJw, Xe, X = _unit_element()
+    mat = J2Material(E=210e3, ν=0.3, σy0=250.0, Hiso=1000.0)
+    # Folded element: negative determinant (det = -1.1 here).
+    Finv = SMatrix{3,3,Float64,9}(-1.1, 0, 0, 0, 1.0, 0, 0, 0, 1.0)
+    @test det(Finv) < 0
+    ue = _ue_from_F(X, Finv)
+    σo = zeros(6, 8)
+    err = nothing
+    try
+        element_force_tangent_finite!(Hex8Finite(), mat, dNdXs, detJw, ue, Xe,
+            zeros(6, 8), zeros(6, 8), zeros(8), _cp_identity(), 1, σo, Val(false))
+    catch e
+        err = e
+    end
+    @test err isa ElementInversionError
+    @test err.J < 0                            # carries the offending J
+    @test err.e == 1                           # and the element index
+    # the kernel must NOT have produced a (silent) zero-stress result
+    @test all(iszero, σo)                      # σo untouched (threw before write)
+    # the F-bar path must fail the same way
+    @test_throws ElementInversionError element_force_tangent_finite!(
+        Hex8FiniteFbar(), mat, dNdXs, detJw, ue, Xe,
+        zeros(6, 8), zeros(6, 8), zeros(8), _cp_identity(), 1, zeros(6, 8), Val(false))
 end
 
 @testset "F12 spatial modulus + geometric stiffness == production tangent (§4.3/§4.4)" begin
