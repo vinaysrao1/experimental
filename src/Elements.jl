@@ -74,6 +74,9 @@ Shape-function derivatives ∂N_a/∂ξ_j w.r.t. natural coords (DESIGN §3.2).
     end)
 end
 
+# ∂N/∂ξ at the element centroid (0,0,0) — a compile-time constant (for F-bar).
+const DN_CENTROID = hex8_dshape(SVector{3,Float64}(0, 0, 0))
+
 """
     jacobian(Xe, dN) -> SMatrix{3,3}
 
@@ -165,8 +168,7 @@ formulation (FINITE_STRAIN §5). `Xe` are reference node coords, `ue` the elemen
 nodal displacements. Allocation-free.
 """
 @inline function element_centroid_J0(Xe::SMatrix{8,3,Float64,24}, ue::SVector{24,Float64})
-    ξ0 = SVector{3,Float64}(0, 0, 0)
-    dN = hex8_dshape(ξ0)
+    dN = DN_CENTROID
     J = jacobian(Xe, dN)
     dNdX0 = dN * inv(J)
     # F₀ = I + Σₐ uₐ ⊗ ∂Nₐ/∂X|₀
@@ -183,7 +185,7 @@ end
 
 # Element node coordinates as an 8×3 SMatrix (allocation-free).
 @inline function element_coords(nodes::Matrix{Float64}, elements::AbstractMatrix{<:Integer}, e::Integer)
-    return SMatrix{8,3,Float64,24}(ntuple(24) do k
+    return SMatrix{8,3,Float64,24}(ntuple(Val(24)) do k
         a = (k - 1) % 8 + 1
         j = (k - 1) ÷ 8 + 1
         nodes[j, elements[a, e]]
@@ -431,7 +433,8 @@ updated plastic history (εp, β, ᾱ, Cp_inv) is written back. Allocation-free.
         F = deformation_gradient(ue, dNdX)
         Jg = det(F)
         # F-bar: replace F by F̄ = (J₀/J)^{1/3} F (volumetric part from centroid).
-        scale = fbar ? (J0 / Jg)^(1 / 3) : 1.0
+        # `cbrt` handles a (transiently) negative ratio gracefully during Newton.
+        scale = fbar ? cbrt(J0 / Jg) : 1.0
         Fbar = fbar ? scale * F : F
 
         Cpi_n = SVector{6,Float64}(Cp_inv[1, idx], Cp_inv[2, idx], Cp_inv[3, idx],
@@ -486,7 +489,7 @@ end
 # G (9×24): ∂F/∂uₑ. F = I + Σₐ uₐ⊗∂Nₐ/∂X ⇒ ∂F_ij/∂u_a^k = δ_ik ∂N_a/∂X_j. The F
 # 9-vector is column-major: index (j-1)*3 + i. Allocation-free.
 @inline function _Gmatrix(dNdX::SMatrix{8,3,Float64,24})
-    return SMatrix{9,24,Float64,216}(ntuple(9 * 24) do idx
+    return SMatrix{9,24,Float64,216}(ntuple(Val(216)) do idx
         r = (idx - 1) % 9 + 1          # F component (column-major (j-1)*3+i)
         c = (idx - 1) ÷ 9 + 1          # local dof
         i = (r - 1) % 3 + 1
@@ -503,8 +506,7 @@ end
 
 # centroid reference gradients ∂N/∂X at natural coords (0,0,0) (for F-bar).
 @inline function _centroid_ref_grads(Xe::SMatrix{8,3,Float64,24})
-    dN0 = hex8_dshape(SVector{3,Float64}(0, 0, 0))
-    return dN0 * inv(jacobian(Xe, dN0))
+    return DN_CENTROID * inv(jacobian(Xe, DN_CENTROID))
 end
 
 # Effective G for F-bar: ∂F̄/∂uₑ where F̄ = (J₀/J)^{1/3} F (de Souza Neto Box 15.2).

@@ -17,6 +17,9 @@ using Test
     @testset "Allocations" begin
         include("test_allocations.jl")
     end
+    @testset "FiniteStrain" begin
+        include("test_finite_strain.jl")
+    end
     @testset "Visualization" begin
         include("test_visualization.jl")
     end

@@ -425,13 +425,10 @@ layout is column-major F: index q = (col-1)*3 + row. Allocation-free.
                            dP[1, 2], dP[2, 2], dP[3, 2],
                            dP[1, 3], dP[2, 3], dP[3, 3])
     end
-    return SMatrix{9,9,Float64,81}(ntuple(81) do k
-        r = (k - 1) % 9 + 1; c = (k - 1) ÷ 9 + 1
-        cols[c][r]
-    end)
+    return hcat(cols...)
 end
 
-@inline _unit3(p::Int, q::Int) = SMatrix{3,3,Float64,9}(ntuple(9) do k
+@inline _unit3(p::Int, q::Int) = SMatrix{3,3,Float64,9}(ntuple(Val(9)) do k
     r = (k - 1) % 3 + 1; c = (k - 1) ÷ 3 + 1
     (r == p && c == q) ? 1.0 : 0.0
 end)
