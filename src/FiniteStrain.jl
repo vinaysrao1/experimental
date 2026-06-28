@@ -168,10 +168,17 @@ and U symmetric positive-definite, via U = (FᵀF)^½ and R = F·U⁻¹. Allocat
 @inline function polar_RU(F::SMatrix{3,3,Float64,9})
     C = Symmetric(F' * F)
     E = eigen(C)
-    sq = SVector{3,Float64}(sqrt(E.values[1]), sqrt(E.values[2]), sqrt(E.values[3]))
+    # FᵀF is SPD for nonsingular F, but a transient/degenerate Newton iterate can
+    # yield a tiny negative eigenvalue numerically; floor at 0 before sqrt.
+    sq = SVector{3,Float64}(sqrt(max(E.values[1], 0.0)),
+                            sqrt(max(E.values[2], 0.0)),
+                            sqrt(max(E.values[3], 0.0)))
     V = E.vectors
     U = V * SMatrix{3,3,Float64,9}(Diagonal(sq)) * V'
-    Uinv = V * SMatrix{3,3,Float64,9}(Diagonal(SVector{3,Float64}(1 / sq[1], 1 / sq[2], 1 / sq[3]))) * V'
+    inv_sq = SVector{3,Float64}(sq[1] > 0 ? 1 / sq[1] : 0.0,
+                                sq[2] > 0 ? 1 / sq[2] : 0.0,
+                                sq[3] > 0 ? 1 / sq[3] : 0.0)
+    Uinv = V * SMatrix{3,3,Float64,9}(Diagonal(inv_sq)) * V'
     return F * Uinv, U
 end
 
@@ -276,12 +283,19 @@ the corrected principal log strains εᵉ_A = εᵉ_tr_A − Δεᵖ_A. Allocati
     # returns the spatial Kirchhoff stress τ and the algorithmic modulus
     # D = ∂τ/∂εᵉ_tr; the two-point tangent (§4.5/§4.6) consumes D plus the
     # ∂β_sp/∂F coupling.
-    R, U = polar_RU(F)
-    β_sp = sym3_to_voigt(R * voigt_to_sym3(β_ref_n) * R')
+    # The back-stress co-rotation is only needed for kinematic hardening; for
+    # Hkin = 0 (isotropic / perfect) β_ref ≡ 0 ⇒ β_sp = 0 for any R, so skip the
+    # polar decomposition entirely (cheaper, and avoids it on a degenerate trial F).
     Z6 = zero(SVector{6,Float64})
+    if mat.Hkin > 0
+        R, U = polar_RU(F)
+        β_sp = sym3_to_voigt(R * voigt_to_sym3(β_ref_n) * R')
+    else
+        R = I3; U = I3; β_sp = Z6
+    end
     τ_voigt, εp_new_inc, β_sp_new, ᾱ_new, D = return_map(mat, kin.εe_tr, Z6, β_sp, ᾱ_n)
     # pull the updated back-stress back to the reference configuration
-    β_ref_new = sym3_to_voigt(R' * voigt_to_sym3(β_sp_new) * R)
+    β_ref_new = mat.Hkin > 0 ? sym3_to_voigt(R' * voigt_to_sym3(β_sp_new) * R) : β_sp_new
 
     # principal Kirchhoff stresses (for diagnostics / the spatial-form fallback)
     τmat = voigt_to_sym3(τ_voigt)
