@@ -372,10 +372,13 @@ function _assemble_threaded!(sp::SparsityPattern, mat::J2Material, kind::Element
                              εp::Matrix{Float64}, β::Matrix{Float64}, ᾱ::Vector{Float64},
                              σ::Matrix{Float64}, Cp_inv::Matrix{Float64}, R::Vector{Float64},
                              ::Val{COMMIT}) where {COMMIT}
+    # Resolve uniform/non-uniform ONCE to a compile-time Val (as the serial path
+    # does), so the per-element call is fully inferred and allocation-free.
+    uv = cache.uniform ? Val(true) : Val(false)
     for color in sp.colors
         Threads.@threads for ci in eachindex(color)
             e = color[ci]
-            _assemble_one!(sp, mat, kind, cache, U, εp, β, ᾱ, σ, Cp_inv, R, Val(COMMIT), e)
+            _assemble_one!(sp, mat, kind, cache, U, εp, β, ᾱ, σ, Cp_inv, R, Val(COMMIT), uv, e)
         end
     end
     return nothing
@@ -386,7 +389,7 @@ end
                                 cache::ElementCache, U::Vector{Float64},
                                 εp::Matrix{Float64}, β::Matrix{Float64}, ᾱ::Vector{Float64},
                                 σ::Matrix{Float64}, Cp_inv::Matrix{Float64}, R::Vector{Float64},
-                                ::Val{COMMIT}, e::Integer) where {COMMIT}
+                                ::Val{COMMIT}, uv::Val{UNIFORM}, e::Integer) where {COMMIT,UNIFORM}
     nzval = sp.K.nzval
     colptr = sp.K.colptr
     rowval = sp.K.rowval
@@ -394,7 +397,7 @@ end
     @inbounds begin
         ue = SVector{24,Float64}(ntuple(i -> U[edofs[i, e]], Val(24)))
         Fe, Ke = _elem_contribution(kind, mat, cache, e, ue, εp, β, ᾱ, σ, Cp_inv,
-                                    Val(COMMIT), Val(cache.uniform))
+                                    Val(COMMIT), uv)
         for c in 1:24
             gcol = edofs[c, e]
             colstart = colptr[gcol]
