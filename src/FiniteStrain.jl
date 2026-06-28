@@ -207,53 +207,6 @@ the corrected principal log strains εᵉ_A = εᵉ_tr_A − Δεᵖ_A. Allocati
     return τ_voigt, εp_new, β_new, ᾱ_new, D, τ_princ, Cp_inv_new
 end
 
-# Rotate a 6×6 algorithmic modulus D = ∂τ/∂εᵉ (physical-shear stress rows,
-# engineering-shear strain columns) from the principal frame to the global frame.
-# We map both sides through the tensor rotation. Implemented by transforming the
-# stress (row) basis and strain (column) basis with the rotation operator R6 such
-# that for any strain εg (engineering Voigt), D_global·εg = R_σ·(D_p·(R_ε·εg)).
-@inline function _rotate_modulus_to_global(Dp::SMatrix{6,6,Float64,36}, Q::SMatrix{3,3,Float64,9})
-    # columns of D_global = global stress response to global unit engineering strains
-    cols = ntuple(Val(6)) do j
-        eg = _unit_eng(j)                       # global engineering-strain unit
-        ep = _rotate_strain_to_princ(eg, Q)     # → principal engineering strain
-        sp = Dp * ep                            # principal stress response
-        _rotate_stress_to_global(sp, Q)         # → global stress
-    end
-    return SMatrix{6,6,Float64,36}(ntuple(36) do k
-        r = (k - 1) % 6 + 1; c = (k - 1) ÷ 6 + 1
-        cols[c][r]
-    end)
-end
-@inline _unit_eng(j::Int) = SVector{6,Float64}(ntuple(i -> i == j ? 1.0 : 0.0, Val(6)))
-
-# Rotate a symmetric *stress-like* tensor (physical-shear Voigt) into the
-# principal frame defined by eigenbasis Q (columns): T' = Qᵀ T Q.
-@inline function _rotate_stress_to_princ(v::SVector{6,Float64}, Q::SMatrix{3,3,Float64,9})
-    T = voigt_to_sym3(v)
-    return sym3_to_voigt(Q' * T * Q)
-end
-@inline function _rotate_stress_to_global(v::SVector{6,Float64}, Q::SMatrix{3,3,Float64,9})
-    T = voigt_to_sym3(v)
-    return sym3_to_voigt(Q * T * Q')
-end
-# Rotate a symmetric *strain-like* tensor (engineering-shear Voigt, γ=2ε): convert
-# to tensor (halve shears), rotate, convert back (double shears).
-@inline function _rotate_strain_to_princ(v::SVector{6,Float64}, Q::SMatrix{3,3,Float64,9})
-    T = SMatrix{3,3,Float64,9}(v[1], 0.5v[4], 0.5v[6],
-                               0.5v[4], v[2], 0.5v[5],
-                               0.5v[6], 0.5v[5], v[3])
-    R = Q' * T * Q
-    return SVector{6,Float64}(R[1, 1], R[2, 2], R[3, 3], 2R[1, 2], 2R[2, 3], 2R[1, 3])
-end
-@inline function _rotate_strain_to_global(v::SVector{6,Float64}, Q::SMatrix{3,3,Float64,9})
-    T = SMatrix{3,3,Float64,9}(v[1], 0.5v[4], 0.5v[6],
-                               0.5v[4], v[2], 0.5v[5],
-                               0.5v[6], 0.5v[5], v[3])
-    R = Q * T * Q'
-    return SVector{6,Float64}(R[1, 1], R[2, 2], R[3, 3], 2R[1, 2], 2R[2, 3], 2R[1, 3])
-end
-
 # --- §4.3: spatial material modulus a (principal-axis form) ---
 
 """
@@ -268,9 +221,16 @@ modulus `D` (FINITE_STRAIN §4.3, Simo & Hughes Box 8.2 / de Souza Neto Box 14.3
       + Σ_A Σ_{B≠A} g_AB (m_AB⊗m_AB + m_AB⊗m_BA)
 
 with g_AB = (τ_A b_B − τ_B b_A)/(b_A − b_B), degenerate limit
-g_AB → ½(D_BB − D_AB) − τ_A. The principal block D_AB is the upper-left 3×3 of D
-(∂τ_A/∂εᵉ_tr_B; the normal-strain block is unaffected by the engineering-shear
-metric since the principal strain input is diagonal). Allocation-free.
+g_AB → ½(D_BB − D_AB) − τ_A. Here `D` must be the **principal-frame** algorithmic
+modulus (i.e. evaluated with a diagonal trial log strain), whose upper-left 3×3
+is the principal block D_AB = ∂τ_A/∂εᵉ_tr_B. Allocation-free.
+
+This is the reference spatial-form material modulus (Box 8.2 / Box 14.3). It is
+exact for an isotropic (coaxial) response and, combined with the §4.4 geometric
+stiffness, reproduces the element tangent in that case. The production element
+kernel instead uses the equivalent two-point P–F form (`dPdF`, §4.5), which is
+also valid for the non-coaxial corrector of kinematic hardening; that form is the
+one FD-verified by the master gate F2.
 """
 @inline function spatial_modulus(kin::FiniteKin, τ_princ::SVector{3,Float64},
                                  D::SMatrix{6,6,Float64,36})
