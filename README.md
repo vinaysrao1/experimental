@@ -195,10 +195,42 @@ additional hard-validation/performance suite, including:
 
 ---
 
-## Scope (v1)
+## Finite strain (large deformation)
 
-Small-strain kinematics, Hex8 elements, J2 plasticity with linear hardening,
-quasi-static loading. Intentionally **not** included (clean extension points are
-left in the design): finite strain, contact/dynamics, nonlinear hardening laws,
-other element types, and B-bar/selective reduced integration for the
-near-incompressible limit. See `docs/DESIGN.md §0, §10`.
+A finite-strain J2 element family is available alongside the small-strain path,
+selected by one keyword at model construction:
+
+```julia
+model = Model(mesh, steel)                        # small strain (default)
+model = Model(mesh, steel; element = :finite)      # finite strain, standard F
+model = Model(mesh, steel; element = :finite_fbar) # finite strain, F-bar
+```
+
+Everything else is identical — `fix!`, `prescribe!`, `load!`, `solve!`,
+`reset!`, `nodal_displacements`, `gauss_stress`, `equivalent_plastic_strain`,
+`write_vtu` all work unchanged. The finite path uses Hencky (logarithmic)
+hyperelasticity with an exponential-map multiplicative split `F = Fᵉ·Fᵖ`
+(`det Fᵖ = 1` exactly), reusing the verified small-strain `return_map` in
+log-strain space. The consistent tangent is the first-Piola/`F` form
+`K = ∫ Gᵀ (∂P/∂F) G dV`, which contains both the material and geometric
+(initial-stress) parts and is finite-difference-verified to ~1e-9.
+
+- `:finite_fbar` applies the F-bar volumetric correction (de Souza Neto et al.
+  1996) for the near-incompressible plastic limit, markedly relieving the
+  volumetric locking of the trilinear Hex8.
+- For finite-strain models `gauss_stress` reports the **Cauchy** stress
+  `σ = τ/J`; `gauss_kirchhoff` returns the raw Kirchhoff stress `τ`. VTK output
+  warps by the displacement vector to show the true deformed shape.
+- Notes: with **kinematic** hardening (and for **F-bar**) the finite-strain
+  algorithmic tangent is slightly non-symmetric (~1e-4 / ~1e-2 respectively),
+  an inherent property of those formulations; use `linsolve=:direct` for those
+  cases. Standard finite strain with isotropic/perfect plasticity yields a
+  symmetric tangent. See `docs/FINITE_STRAIN.md`.
+
+## Scope
+
+Hex8 elements, J2 plasticity with linear (isotropic + kinematic) hardening,
+quasi-static loading, in **both** small-strain and finite-strain kinematics.
+Intentionally **not** included: contact/dynamics, nonlinear hardening laws,
+other element types, anisotropic plasticity, thermomechanics. See
+`docs/DESIGN.md §0, §10` and `docs/FINITE_STRAIN.md §0`.

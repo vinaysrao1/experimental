@@ -12,7 +12,7 @@ module Visualization
 
 using StaticArrays
 using ..MeshMod: Mesh
-using ..ModelMod: Model
+using ..ModelMod: Model, gauss_stress
 using ..Elements: element_geometry
 
 export write_vtu, gauss_strain, von_mises
@@ -132,7 +132,9 @@ function write_vtu(filename::AbstractString, model::Model)
     nn = mesh.nnodes
     ne = mesh.nelem
 
-    σc = _cell_avg6(model.state_committed.σ, ne)
+    # `gauss_stress` reports Cauchy for finite-strain models (Kirchhoff/J),
+    # the committed engineering stress for small strain (FINITE_STRAIN §6.4).
+    σc = _cell_avg6(gauss_stress(model), ne)
     εc = _cell_avg6(gauss_strain(model), ne)
     ᾱc = _cell_avg1(model.state_committed.ᾱ, ne)
     U = model.U
