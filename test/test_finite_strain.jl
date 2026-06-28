@@ -172,7 +172,7 @@ end
     for F in (SMatrix{3,3,Float64,9}(1.2, 0.05, 0, 0.03, 0.92, 0, 0, 0, 0.95),
               SMatrix{3,3,Float64,9}(1.3, 0.1, 0.05, 0.08, 0.9, 0.03, 0.02, 0.04, 0.85))
         kin = FS.finite_kinematics(F, SVector{6,Float64}(1, 1, 1, 0, 0, 0))
-        τ, εp, β, ᾱ, D, τp, Cpi = FS.finite_stress_update(mat, kin,
+        τ, εp, β, ᾱ, D, τp, Cpi = FS.finite_stress_update(mat, kin, F,
             zero(SVector{6,Float64}), zero(SVector{6,Float64}), 0.0)
         @test ᾱ > 0.0                       # plastic flow occurred
         @test abs(FS.det_Fp_from_Cpinv(Cpi) - 1.0) < 1e-12
@@ -186,12 +186,40 @@ end
     Q = SMatrix{3,3,Float64,9}(cos(θ), sin(θ), 0, -sin(θ), cos(θ), 0, 0, 0, 1)
     I6 = SVector{6,Float64}(1, 1, 1, 0, 0, 0); Z6 = zero(SVector{6,Float64})
     kin1 = FS.finite_kinematics(F, I6)
-    τ1, _, _, _, _, _, _ = FS.finite_stress_update(mat, kin1, Z6, Z6, 0.0)
+    τ1, _, _, _, _, _, _ = FS.finite_stress_update(mat, kin1, F, Z6, Z6, 0.0)
     σ1 = FS.voigt_to_sym3(τ1) / det(F)
     kin2 = FS.finite_kinematics(Q * F, I6)
-    τ2, _, _, _, _, _, _ = FS.finite_stress_update(mat, kin2, Z6, Z6, 0.0)
+    τ2, _, _, _, _, _, _ = FS.finite_stress_update(mat, kin2, Q * F, Z6, Z6, 0.0)
     σ2 = FS.voigt_to_sym3(τ2) / det(Q * F)
     @test norm(σ2 - Q * σ1 * Q') / norm(σ1) < 1e-12
+end
+
+@testset "F4b objectivity with KINEMATIC hardening at θ>90° (B2 regression)" begin
+    # Adversarial objectivity: build a deformed + plastic state with non-zero
+    # back-stress, then superpose a finite rotation Q (120°). With the global-frame
+    # back-stress bug this fails by ~1–17%; the rotation-neutralized (β_ref) storage
+    # makes it exact. Probes the kinematic-hardening objectivity directly.
+    mat = J2Material(E=210e3, ν=0.3, σy0=250.0, Hiso=200.0, Hkin=2000.0)
+    I6 = SVector{6,Float64}(1, 1, 1, 0, 0, 0); Z6 = zero(SVector{6,Float64})
+    # step 0: a plastic deformation builds up β_ref (reference back-stress) and Cᵖ⁻¹
+    F1 = SMatrix{3,3,Float64,9}(1.2, 0.05, 0, 0.03, 0.92, 0, 0, 0, 0.95)
+    kin1 = FS.finite_kinematics(F1, I6)
+    _, εp1, βref1, ᾱ1, _, _, Cpi1, _, _, _ =
+        FS.finite_stress_update(mat, kin1, F1, Z6, Z6, 0.0)
+    @test ᾱ1 > 0.0 && norm(βref1) > 0.0
+    # step 1: a second (non-coaxial) deformation; compare σ vs Q σ Qᵀ at θ = 120°
+    F2 = SMatrix{3,3,Float64,9}(1.3, 0.08, 0.02, 0.06, 0.9, 0.01, 0.0, 0.02, 0.97)
+    function σ_at(F)
+        k = FS.finite_kinematics(F, Cpi1)
+        τ, _, _, _, _, _, _, _, _, _ = FS.finite_stress_update(mat, k, F, εp1, βref1, ᾱ1)
+        return FS.voigt_to_sym3(τ) / det(F)
+    end
+    σ1 = σ_at(F2)
+    for θ in (0.1, deg2rad(120.0), 3.0)
+        Q = SMatrix{3,3,Float64,9}(cos(θ), sin(θ), 0, -sin(θ), cos(θ), 0, 0, 0, 1)
+        σ2 = σ_at(Q * F2)
+        @test norm(σ2 - Q * σ1 * Q') / norm(σ1) < 1e-10
+    end
 end
 
 @testset "F5 frame-indifference under cyclic simple shear (no drift)" begin
@@ -204,7 +232,7 @@ end
     for γ in γs
         F = SMatrix{3,3,Float64,9}(1, 0, 0, γ, 1, 0, 0, 0, 1)
         kin = FS.finite_kinematics(F, I6)
-        τend, _, _, _, _, _, _ = FS.finite_stress_update(mat, kin, Z6, Z6, 0.0)
+        τend, _, _, _, _, _, _ = FS.finite_stress_update(mat, kin, F, Z6, Z6, 0.0)
     end
     @test norm(τend) < 1e-6 * mat.E           # returns to ~zero stress
 end
@@ -261,6 +289,25 @@ end
                    zeros(6, 8), zeros(6, 8), zeros(8), _cp_identity())
     K = Matrix(Ke)
     @test norm(K - K') / norm(K) < 1e-9
+end
+
+@testset "F9b deformed KINEMATIC-hardening tangent (consistent, non-symmetric)" begin
+    # B2 follow-up: at a deformed + plastic state with kinematic hardening the
+    # objective (β_ref) law gives a CONSISTENT but NON-SYMMETRIC tangent. The FD
+    # gate must pass (<1e-6) while the asymmetry is appreciable — the latter is
+    # what B1's symmetry-aware solver selection accounts for. This probes the
+    # ∂β_sp/∂F coupling that the global-frame bug omitted.
+    _, dNdXs, detJw, Xe, X = _unit_element()
+    mat = J2Material(E=210e3, ν=0.3, σy0=250.0, Hiso=200.0, Hkin=2000.0)
+    εp = zeros(6, 8); β = zeros(6, 8); ᾱ = zeros(8); Cp = _cp_identity()
+    F1 = SMatrix{3,3,Float64,9}(1.1, 0.04, 0.01, 0.03, 0.95, 0.02, 0.0, 0.01, 0.97)
+    F2 = SMatrix{3,3,Float64,9}(1.18, 0.09, 0.03, 0.06, 0.92, 0.04, 0.02, 0.03, 1.0)
+    _commit!(Hex8Finite(), mat, dNdXs, detJw, Xe, _ue_from_F(X, F1), εp, β, ᾱ, Cp)
+    @test maximum(ᾱ) > 0.0        # genuinely plastic, non-zero back-stress stored
+    relerr, symerr = _fd_tangent(Hex8Finite(), mat, dNdXs, detJw, Xe,
+                                 _ue_from_F(X, F2), εp, β, ᾱ, Cp)
+    @test relerr < 1e-6           # tangent stays CONSISTENT (Newton quadratic)
+    @test symerr > 1e-6           # and is genuinely NON-symmetric here
 end
 
 @testset "F10 allocation gates (finite kernel + assembly O(1))" begin

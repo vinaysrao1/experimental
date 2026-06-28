@@ -12,7 +12,7 @@ using LinearAlgebra
 using ..Materials: J2Material, return_map
 using ..FiniteStrain: FiniteStrain, ElementKind, Hex8Small, Hex8Finite, Hex8FiniteFbar,
     deformation_gradient, finite_kinematics, finite_stress_update, spatial_modulus,
-    voigt_to_sym3, sym3_to_voigt, dPdF, first_piola
+    voigt_to_sym3, sym3_to_voigt, dPdF, first_piola, dtau_dbeta
 
 export hex8_shape, hex8_dshape, jacobian, bmatrix, precompute_cache,
        element_force_tangent!, element_force_tangent_finite!, geometric_stiffness,
@@ -446,17 +446,21 @@ updated plastic history (εp, β, ᾱ, Cp_inv) is written back. Allocation-free.
                                  β[4, idx], β[5, idx], β[6, idx])
         ᾱ_n = ᾱ[idx]
 
-        τ, εp_new, β_new, ᾱ_new, D, τ_princ, Cpi_new =
-            finite_stress_update(mat, kin, εp_n, β_n, ᾱ_n)
+        τ, εp_new, β_new, ᾱ_new, D, τ_princ, Cpi_new, β_sp, Rpol, Upol =
+            finite_stress_update(mat, kin, Fbar, εp_n, β_n, ᾱ_n)
 
-        # Two-point (P–F) form (FINITE_STRAIN §4.5): P = τ·F̄⁻ᵀ, A = ∂P/∂F̄ (9×9),
-        # G (9×24) maps uₑ→F via the reference gradients. fe = ∫ Gᵀ P, Ke = ∫ Gᵀ A G
-        # — this automatically contains both material and geometric parts and is
-        # valid for the non-coaxial corrector (combined iso+kin hardening).
+        # Two-point (P–F) form (FINITE_STRAIN §4.5/§4.6): P = τ·F̄⁻ᵀ, A = ∂P/∂F̄
+        # (9×9), G (9×24) maps uₑ→F via the reference gradients. fe = ∫ Gᵀ P,
+        # Ke = ∫ Gᵀ A G — this automatically contains both material and geometric
+        # parts. With kinematic hardening the spatial back-stress depends on F̄
+        # through the polar rotation, so `dPdF` adds the ∂τ/∂β·∂β_sp/∂F̄ coupling
+        # (objective; makes the tangent non-symmetric but consistent).
         Gmat = _Gmatrix(dNdX)
         P = first_piola(τ, kin.Finv)              # 3×3 (from F̄)
         Pv = _p9(P)
-        A = dPdF(kin, Cpi_n, D, τ, Fbar)          # ∂P/∂F̄
+        dtdb = mat.Hkin > 0 ? dtau_dbeta(mat, kin.εe_tr, β_sp, ᾱ_n) :
+                              zero(SMatrix{6,6,Float64,36})
+        A = dPdF(kin, Cpi_n, D, τ, Fbar; β_ref=β_n, R=Rpol, U=Upol, dtdb=dtdb)  # ∂P/∂F̄
 
         Fe += (Gmat' * Pv) * w
         if fbar

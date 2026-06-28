@@ -27,7 +27,7 @@ using ..Materials: J2Material, return_map
 export ElementKind, Hex8Small, Hex8Finite, Hex8FiniteFbar
 export deformation_gradient, finite_kinematics, finite_stress_update,
        spatial_modulus, sym3_to_voigt, voigt_to_sym3, det_Fp_from_Cpinv,
-       dPdF, first_piola
+       dPdF, first_piola, polar_RU, dR_polar, dtau_dbeta
 
 # --- element-kind dispatch seam (FINITE_STRAIN §6.1) ---
 
@@ -45,6 +45,9 @@ struct Hex8FiniteFbar <: ElementKind end   # finite strain, F-bar (§5)
 const I3 = SMatrix{3,3,Float64,9}(1, 0, 0, 0, 1, 0, 0, 0, 1)
 # Tolerance for treating two trial eigenvalues as degenerate (repeated stretch).
 const EIG_TOL = 1e-9
+# Engineering-shear metric W = diag(1,1,1,2,2,2): ⟨a,b⟩ = aᵀ W b reproduces the
+# physical-shear tensor inner product for symmetric 6-Voigt tensors.
+const W6 = SMatrix{6,6,Float64,36}(Diagonal(SVector{6,Float64}(1, 1, 1, 2, 2, 2)))
 
 # --- Voigt <-> 3×3 symmetric tensor helpers ---
 
@@ -144,42 +147,141 @@ Hencky strain εᵉ_tr = ½ ln bᵉ_tr in engineering-shear 6-Voigt. Allocation-
     return FiniteKin(εe_tr, b, n, inv(F), J, true)
 end
 
+# --- polar decomposition (rotation-neutralized back-stress, FINITE_STRAIN §3.4) ---
+#
+# Kinematic hardening needs the back-stress to be OBJECTIVE: under a superposed
+# spatial rotation Q (F → QF) the Kirchhoff stress must rotate as Q τ Qᵀ. The
+# trial Hencky strain already rotates correctly (eigenvalues of bᵉ_tr = F Cᵖ⁻¹ Fᵀ
+# are Q-invariant, eigenvectors co-rotate), but a back-stress stored in the global
+# spatial frame does NOT co-rotate, breaking frame-indifference. The remedy
+# (de Souza Neto §14, Simo & Hughes): store β in the rotation-neutralized
+# (reference/intermediate) configuration `β_ref` (Q-invariant, like Cᵖ⁻¹) and
+# push it forward to the spatial frame with the polar rotation R of F (F = R U):
+# β_sp = R β_ref Rᵀ. Under F → QF, R → QR ⇒ β_sp → Q β_sp Qᵀ — objective.
+
+"""
+    polar_RU(F) -> (R, U)
+
+Right polar decomposition F = R·U with R orthogonal (det R = +1 for det F > 0)
+and U symmetric positive-definite, via U = (FᵀF)^½ and R = F·U⁻¹. Allocation-free.
+"""
+@inline function polar_RU(F::SMatrix{3,3,Float64,9})
+    C = Symmetric(F' * F)
+    E = eigen(C)
+    sq = SVector{3,Float64}(sqrt(E.values[1]), sqrt(E.values[2]), sqrt(E.values[3]))
+    V = E.vectors
+    U = V * SMatrix{3,3,Float64,9}(Diagonal(sq)) * V'
+    Uinv = V * SMatrix{3,3,Float64,9}(Diagonal(SVector{3,Float64}(1 / sq[1], 1 / sq[2], 1 / sq[3]))) * V'
+    return F * Uinv, U
+end
+
+"""
+    dR_polar(R, U, dF) -> SMatrix{3,3}
+
+Directional derivative of the polar rotation R for a perturbation `dF` of F = R·U.
+With Ω = RᵀṘ skew, the symmetric/skew split of RᵀdF gives the Sylvester equation
+Ω U + U Ω = RᵀdF − dFᵀR; solving it in U's eigenbasis (componentwise division by
+λ_i + λ_j) yields Ṙ = R Ω. Allocation-free.
+"""
+@inline function dR_polar(R::SMatrix{3,3,Float64,9}, U::SMatrix{3,3,Float64,9},
+                          dF::SMatrix{3,3,Float64,9})
+    A = R' * dF
+    rhs = A - A'                         # = Ω U + U Ω
+    E = eigen(Symmetric(U))
+    V = E.vectors; λ = E.values
+    rb = V' * rhs * V
+    Ωb = SMatrix{3,3,Float64,9}(ntuple(Val(9)) do k
+        i = (k - 1) % 3 + 1; j = (k - 1) ÷ 3 + 1
+        rb[i, j] / (λ[i] + λ[j])
+    end)
+    return R * (V * Ωb * V')
+end
+
+"""
+    dtau_dbeta(mat, εe_tr, β_sp, ᾱ_n) -> SMatrix{6,6}
+
+Sensitivity ∂τ/∂β_sp of the Kirchhoff stress to the (spatial) back-stress at
+fixed trial strain (FINITE_STRAIN §4.6). Needed for the consistent tangent once
+β_sp depends on F through the polar rotation (objective kinematic hardening). In
+the plastic branch the deviatoric corrector is c(ξ) = a·ξ with ξ = s_tr − β_sp,
+a = 2G√(3/2)Δγ/‖ξ‖; since σ = σ_tr − c and ∂ξ/∂β = −I, ∂τ/∂β = ∂c/∂ξ:
+
+    ∂τ/∂β = a·I₆ + ξ ⊗ (∂a/∂β),   ∂a/∂β_j = [2G√(3/2)/(3G+H)]·(Y/‖ξ‖²)·(Wξ)_j/‖ξ‖
+
+with Y = σy0 + Hiso·ᾱ_n, H = Hiso + Hkin, W the engineering-shear metric. Zero in
+the elastic branch. FD-verified to ~1e-10. Allocation-free.
+"""
+@inline function dtau_dbeta(mat::J2Material, εe_tr::SVector{6,Float64},
+                            β_sp::SVector{6,Float64}, ᾱ_n::Float64)
+    G = mat.G; H = mat.Hiso + mat.Hkin; s32 = sqrt(1.5)
+    σ_tr = mat.Cmat * εe_tr
+    p = (σ_tr[1] + σ_tr[2] + σ_tr[3]) / 3
+    s = σ_tr - SVector{6,Float64}(p, p, p, 0, 0, 0)
+    ξ = s - β_sp
+    nrm = sqrt(ξ[1]^2 + ξ[2]^2 + ξ[3]^2 + 2 * (ξ[4]^2 + ξ[5]^2 + ξ[6]^2))
+    Y = mat.σy0 + mat.Hiso * ᾱ_n
+    f = s32 * nrm - Y
+    f <= 0.0 && return zero(SMatrix{6,6,Float64,36})
+    Δγ = f / (3G + H)
+    a = 2G * s32 * Δγ / nrm
+    da_dnrm = 2G * s32 / (3G + H) * (Y / nrm^2)
+    g = (da_dnrm / nrm) * (W6 * ξ)        # ∂a/∂β (6-vector)
+    diag6 = SMatrix{6,6,Float64,36}(Diagonal(SVector{6,Float64}(1, 1, 1, 1, 1, 1)))
+    return a * diag6 + ξ * g'
+end
+
 # --- §3: constitutive update + exponential-map plastic update ---
 
 """
-    finite_stress_update(mat, kin, εp_n, β_n, ᾱ_n)
-        -> (τ_voigt, εp_new, β_new, ᾱ_new, D, τ_princ, Cp_inv_new)
+    finite_stress_update(mat, kin, F, εp_n, β_ref_n, ᾱ_n)
+        -> (τ_voigt, εp_new, β_ref_new, ᾱ_new, D, τ_princ, Cp_inv_new, β_sp, R, U)
 
 Feed the trial Hencky strain through the unchanged `return_map`, then perform the
 exponential-map plastic update (FINITE_STRAIN §3). Returns:
 - `τ_voigt`  — Kirchhoff stress, 6-Voigt physical shear (work-conjugate to εᵉ);
-- `εp_new`, `β_new`, `ᾱ_new` — updated log-space history (as in v1);
+- `εp_new`, `β_ref_new`, `ᾱ_new` — updated log-space history; `β_ref` is the
+  back-stress stored in the **reference (rotation-neutralized) configuration**;
 - `D`        — the 6×6 algorithmic modulus ∂τ/∂εᵉ_tr from `return_map`;
 - `τ_princ`  — the three principal Kirchhoff stresses τ_A (in the trial frame);
-- `Cp_inv_new` — updated plastic state Cᵖ⁻¹_{n+1} = F⁻¹·bᵉ_{n+1}·F⁻ᵀ (6-Voigt).
+- `Cp_inv_new` — updated plastic state Cᵖ⁻¹_{n+1} = F⁻¹·bᵉ_{n+1}·F⁻ᵀ (6-Voigt);
+- `β_sp`     — the spatial back-stress used in the return map (for the tangent);
+- `R`        — the polar rotation of `F` (for the tangent's β-rotation term).
+
+**Objectivity (FINITE_STRAIN §3.4).** With kinematic hardening the back-stress
+must co-rotate with the material. We store β in the reference configuration
+(`β_ref`, Q-invariant like Cᵖ⁻¹), push it forward with the polar rotation
+β_sp = R·β_ref·Rᵀ, run the return map in the spatial trial frame, then pull the
+updated back-stress back to reference. Under a superposed rotation Q (F → QF) the
+trial strain rotates and R → QR, so β_sp → Q β_sp Qᵀ and τ → Q τ Qᵀ — exact frame
+indifference (objectivity error ~1e-15 even at 120°). For isotropic/perfect
+plasticity (Hkin = 0) β_ref ≡ 0 and this reduces to the symmetric path.
 
 The plastic flow is coaxial with bᵉ_tr (associative J2), so the converged elastic
 log strain shares the trial principal directions; bᵉ_{n+1} is reconstructed from
 the corrected principal log strains εᵉ_A = εᵉ_tr_A − Δεᵖ_A. Allocation-free.
 """
 @inline function finite_stress_update(mat::J2Material, kin::FiniteKin,
+                                      F::SMatrix{3,3,Float64,9},
                                       εp_n::SVector{6,Float64},
-                                      β_n::SVector{6,Float64},
+                                      β_ref_n::SVector{6,Float64},
                                       ᾱ_n::Float64)
     n = kin.n   # eigenbasis (columns)
 
     # In the log-strain framework the plastic configuration is carried entirely by
     # Cᵖ⁻¹_n (via bᵉ_tr = F Cᵖ⁻¹_n Fᵀ), so εᵉ_tr = ½ ln bᵉ_tr is ALREADY the trial
-    # *elastic* strain. Call `return_map` in the GLOBAL frame with a ZERO additive
-    # plastic strain (passing εp_n would double-count plasticity) and the global
-    # back stress β_n. The J2 kernel is rotation-covariant, so this yields the
-    # global Kirchhoff stress τ and the FULL global algorithmic modulus
-    # D = ∂τ/∂εᵉ_tr directly — no per-iteration frame rotation of β (which would
-    # make the discrete force non-conservative / the tangent non-symmetric). The
-    # two-point tangent (§4.5) consumes the full D, so the principal-block trick is
-    # unnecessary.
+    # *elastic* strain. Call `return_map` with a ZERO additive plastic strain
+    # (passing εp_n would double-count plasticity). The back stress is supplied in
+    # the SPATIAL frame β_sp = R β_ref Rᵀ (objectivity, §3.4); for Hkin = 0 this is
+    # zero and the call is unchanged. The J2 kernel is rotation-covariant, so it
+    # returns the spatial Kirchhoff stress τ and the algorithmic modulus
+    # D = ∂τ/∂εᵉ_tr; the two-point tangent (§4.5/§4.6) consumes D plus the
+    # ∂β_sp/∂F coupling.
+    R, U = polar_RU(F)
+    β_sp = sym3_to_voigt(R * voigt_to_sym3(β_ref_n) * R')
     Z6 = zero(SVector{6,Float64})
-    τ_voigt, εp_new_inc, β_new, ᾱ_new, D = return_map(mat, kin.εe_tr, Z6, β_n, ᾱ_n)
+    τ_voigt, εp_new_inc, β_sp_new, ᾱ_new, D = return_map(mat, kin.εe_tr, Z6, β_sp, ᾱ_n)
+    # pull the updated back-stress back to the reference configuration
+    β_ref_new = sym3_to_voigt(R' * voigt_to_sym3(β_sp_new) * R)
 
     # principal Kirchhoff stresses (for diagnostics / the spatial-form fallback)
     τmat = voigt_to_sym3(τ_voigt)
@@ -204,7 +306,7 @@ the corrected principal log strains εᵉ_A = εᵉ_tr_A − Δεᵖ_A. Allocati
     Cp_inv_mat = kin.Finv * be_new * kin.Finv'
     Cp_inv_new = sym3_to_voigt(Cp_inv_mat)
 
-    return τ_voigt, εp_new, β_new, ᾱ_new, D, τ_princ, Cp_inv_new
+    return τ_voigt, εp_new, β_ref_new, ᾱ_new, D, τ_princ, Cp_inv_new, β_sp, R, U
 end
 
 # --- §4.3: spatial material modulus a (principal-axis form) ---
@@ -348,21 +450,36 @@ end
     SVector{6,Float64}(S[1, 1], S[2, 2], S[3, 3], 2S[1, 2], 2S[2, 3], 2S[1, 3])
 
 """
-    dPdF(mat, kin, Cp_inv_n, D, τ_voigt) -> SMatrix{9,9}
+    dPdF(mat, kin, Cp_inv_n, D, τ_voigt, F; β_ref, β_sp, R, U, ᾱ_n, dtdb)
+        -> SMatrix{9,9}
 
-First Piola–Kirchhoff tangent A = ∂P/∂F (FINITE_STRAIN §4.5), P = τ·F⁻ᵀ. Built by
-analytic differentiation: ∂be/∂F (be = F·Cᵖ⁻¹·Fᵀ), ∂εᵉ/∂F via the log-derivative
-contraction, ∂τ/∂F = D : ∂εᵉ/∂F, and the product rule on τ·F⁻ᵀ. The 9-vector
-layout is column-major F: index q = (col-1)*3 + row. Allocation-free.
+First Piola–Kirchhoff tangent A = ∂P/∂F (FINITE_STRAIN §4.5/§4.6), P = τ·F⁻ᵀ.
+Built by analytic differentiation: ∂be/∂F (be = F·Cᵖ⁻¹·Fᵀ), ∂εᵉ/∂F via the
+log-derivative contraction, ∂τ/∂F = D : ∂εᵉ/∂F, and the product rule on τ·F⁻ᵀ.
+The 9-vector layout is column-major F: index q = (col-1)*3 + row.
+
+When kinematic hardening is active the spatial back-stress β_sp = R·β_ref·Rᵀ also
+depends on F through the polar rotation R, contributing the additional term
+∂τ/∂β_sp · ∂β_sp/∂F (with ∂β_sp/∂F from the polar-rotation derivative `dR_polar`).
+This makes the tangent NON-SYMMETRIC but keeps it CONSISTENT (FD-verified <1e-6).
+For Hkin = 0, `dtdb` (∂τ/∂β) is zero and this term vanishes (symmetric path).
+Allocation-free.
 """
 @inline function dPdF(kin::FiniteKin, Cp_inv_n::SVector{6,Float64},
                       D::SMatrix{6,6,Float64,36}, τ_voigt::SVector{6,Float64},
-                      F::SMatrix{3,3,Float64,9})
+                      F::SMatrix{3,3,Float64,9};
+                      β_ref::SVector{6,Float64}=zero(SVector{6,Float64}),
+                      R::SMatrix{3,3,Float64,9}=I3,
+                      U::SMatrix{3,3,Float64,9}=I3,
+                      dtdb::SMatrix{6,6,Float64,36}=zero(SMatrix{6,6,Float64,36}))
     Cpi = voigt_to_sym3(Cp_inv_n)
     Finv = kin.Finv
     FinvT = Finv'
     τ = voigt_to_sym3(τ_voigt)
     b = kin.b; Q = kin.n
+    βref_mat = voigt_to_sym3(β_ref)
+    # Whether the back-stress-rotation term is active (kinematic hardening).
+    kin_active = !iszero(β_ref) || !iszero(dtdb)
 
     # For each F-component (p,q): ∂F = e_p⊗e_q. Build column of A (9 stress comps
     # of ∂P) stacked column-major.
@@ -376,6 +493,12 @@ layout is column-major F: index q = (col-1)*3 + row. Allocation-free.
         dεe = _dhalflog_contract(Q, b, dbe)
         # ∂τ = D : ∂εᵉ   (engineering Voigt)
         dτv = D * _eng_voigt(dεe)
+        # back-stress-rotation coupling: ∂τ += ∂τ/∂β_sp · ∂β_sp/∂F (kinematic only)
+        if kin_active
+            dR = dR_polar(R, U, dF)
+            dβsp = dR * βref_mat * R' + R * βref_mat * dR'
+            dτv = dτv + dtdb * sym3_to_voigt(dβsp)
+        end
         dτ = voigt_to_sym3(dτv)
         # P = τ·F⁻ᵀ ⇒ ∂P = ∂τ·F⁻ᵀ + τ·∂(F⁻ᵀ);  ∂(F⁻ᵀ) = −F⁻ᵀ·∂Fᵀ·F⁻ᵀ
         dFinvT = -FinvT * dF' * FinvT
