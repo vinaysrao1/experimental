@@ -10,10 +10,17 @@ module Elements
 using StaticArrays
 using LinearAlgebra
 using ..Materials: J2Material, return_map
+using ..FiniteStrain: FiniteStrain, ElementKind, Hex8Small, Hex8Finite, Hex8FiniteFbar,
+    deformation_gradient, finite_kinematics, finite_stress_update, spatial_modulus,
+    voigt_to_sym3, sym3_to_voigt, dPdF, first_piola
 
 export hex8_shape, hex8_dshape, jacobian, bmatrix, precompute_cache,
-       element_force_tangent!, ElementCache, element_geometry, element_coords,
+       element_force_tangent!, element_force_tangent_finite!, geometric_stiffness,
+       ElementCache, element_geometry, element_coords,
+       element_ref_grads, element_centroid_J0,
        GAUSS_PTS, GAUSS_WTS, NODE_NAT
+
+const I3const = SMatrix{3,3,Float64,9}(1, 0, 0, 0, 1, 0, 0, 0, 1)
 
 # Natural coordinates of the 8 nodes (DESIGN §3.1, VTK_HEXAHEDRON ordering)
 const NODE_NAT = SMatrix{8,3,Float64,24}(
@@ -133,6 +140,47 @@ it can be reused for both the cached reference element and the on-the-fly fallba
     return Bs, detJw
 end
 
+"""
+    element_ref_grads(Xe) -> SVector{8, SMatrix{8,3}}
+
+Reference shape gradients ∂Nₐ/∂X per Gauss point (8×3 each) for an element with
+*undeformed* node coordinates `Xe::SMatrix{8,3}` (FINITE_STRAIN §2.1, §6.3).
+These equal the v1 spatial gradients of the reference element (`dN·J_ref⁻¹`) and
+depend only on the undeformed mesh, so they share the v1 uniform-mesh caching.
+Allocation-free.
+"""
+@inline function element_ref_grads(Xe::SMatrix{8,3,Float64,24})
+    return SVector{8,SMatrix{8,3,Float64,24}}(ntuple(Val(8)) do g
+        dN = hex8_dshape(GAUSS_PTS[g])
+        J = jacobian(Xe, dN)
+        dN * inv(J)
+    end)
+end
+
+"""
+    element_centroid_J0(Xe, ue) -> Float64
+
+J₀ = det F₀ at the element centroid (natural coords (0,0,0)) for the F-bar
+formulation (FINITE_STRAIN §5). `Xe` are reference node coords, `ue` the element
+nodal displacements. Allocation-free.
+"""
+@inline function element_centroid_J0(Xe::SMatrix{8,3,Float64,24}, ue::SVector{24,Float64})
+    ξ0 = SVector{3,Float64}(0, 0, 0)
+    dN = hex8_dshape(ξ0)
+    J = jacobian(Xe, dN)
+    dNdX0 = dN * inv(J)
+    # F₀ = I + Σₐ uₐ ⊗ ∂Nₐ/∂X|₀
+    F0 = SMatrix{3,3,Float64,9}(1, 0, 0, 0, 1, 0, 0, 0, 1)
+    @inbounds for a in 1:8
+        ux = ue[3(a - 1) + 1]; uy = ue[3(a - 1) + 2]; uz = ue[3(a - 1) + 3]
+        gx = dNdX0[a, 1]; gy = dNdX0[a, 2]; gz = dNdX0[a, 3]
+        F0 += SMatrix{3,3,Float64,9}(ux * gx, uy * gx, uz * gx,
+                                     ux * gy, uy * gy, uz * gy,
+                                     ux * gz, uy * gz, uz * gz)
+    end
+    return det(F0)
+end
+
 # Element node coordinates as an 8×3 SMatrix (allocation-free).
 @inline function element_coords(nodes::Matrix{Float64}, elements::AbstractMatrix{<:Integer}, e::Integer)
     return SMatrix{8,3,Float64,24}(ntuple(24) do k
@@ -161,6 +209,7 @@ struct ElementCache
     uniform::Bool
     Bref::SVector{8,SMatrix{6,24,Float64,144}}
     detJwref::SVector{8,Float64}
+    dNdXref::SVector{8,SMatrix{8,3,Float64,24}}   # reference shape grads ∂N/∂X (§6.3)
     nodes::Matrix{Float64}
     elements::Matrix{Int}
 end
@@ -178,6 +227,22 @@ the hot assembly loop (SCALING.md §2.2).
     else
         Xe = element_coords(cache.nodes, cache.elements, e)
         return element_geometry(Xe)
+    end
+end
+
+"""
+    element_ref_grads(cache, e) -> SVector{8, SMatrix{8,3}}
+
+Reference shape gradients ∂N/∂X for element `e`: the cached reference set if the
+mesh is uniform, otherwise recomputed on the fly. Allocation-free (FINITE_STRAIN
+§6.3).
+"""
+@inline function element_ref_grads(cache::ElementCache, e::Integer)
+    if cache.uniform
+        return cache.dNdXref
+    else
+        Xe = element_coords(cache.nodes, cache.elements, e)
+        return element_ref_grads(Xe)
     end
 end
 
@@ -226,14 +291,17 @@ function precompute_cache(nodes::Matrix{Float64}, elements::Matrix{Int})
     if uniform
         Xe = element_coords(nodes, elements, 1)
         Bref, detJwref = element_geometry(Xe)
+        dNdXref = element_ref_grads(Xe)
         @assert all(>(0), detJwref) "non-positive detJ in reference element (check node ordering)"
-        return ElementCache(true, Bref, detJwref, nodes, elements)
+        return ElementCache(true, Bref, detJwref, dNdXref, nodes, elements)
     else
         # placeholder reference set (unused when uniform=false)
         Bz = zero(SMatrix{6,24,Float64,144})
         Bref = SVector{8,SMatrix{6,24,Float64,144}}(ntuple(_ -> Bz, 8))
         detJwref = zero(SVector{8,Float64})
-        return ElementCache(false, Bref, detJwref, nodes, elements)
+        Gz = zero(SMatrix{8,3,Float64,24})
+        dNdXref = SVector{8,SMatrix{8,3,Float64,24}}(ntuple(_ -> Gz, 8))
+        return ElementCache(false, Bref, detJwref, dNdXref, nodes, elements)
     end
 end
 
@@ -287,6 +355,168 @@ resolved at compile time and the kernel stays allocation-free.
         end
     end
     return Fe, Ke
+end
+
+# --- finite-strain element kernel (FINITE_STRAIN §2–5) ---
+
+"""
+    geometric_stiffness(dNdx, τmat, w) -> SMatrix{24,24}
+
+Geometric / initial-stress stiffness (FINITE_STRAIN §4.4):
+Kᵍ[(a,i),(b,k)] = δ_ik (∂Nₐ/∂x)ᵀ τ (∂N_b/∂x) · w, with `dNdx::SMatrix{8,3}` the
+spatial gradients and `τmat` the 3×3 Kirchhoff stress. Adds the same scalar
+`g_aᵀ τ g_b · w` to all three diagonal component-blocks of node-pair (a,b).
+Allocation-free.
+"""
+@inline function geometric_stiffness(dNdx::SMatrix{8,3,Float64,24},
+                                     τmat::SMatrix{3,3,Float64,9}, w::Float64)
+    return SMatrix{24,24,Float64,576}(ntuple(24 * 24) do k
+        r = (k - 1) % 24 + 1
+        c = (k - 1) ÷ 24 + 1
+        i = (r - 1) % 3 + 1     # component of row dof
+        kk = (c - 1) % 3 + 1    # component of col dof
+        if i != kk
+            0.0
+        else
+            a = (r - 1) ÷ 3 + 1
+            b = (c - 1) ÷ 3 + 1
+            ga = SVector{3,Float64}(dNdx[a, 1], dNdx[a, 2], dNdx[a, 3])
+            gb = SVector{3,Float64}(dNdx[b, 1], dNdx[b, 2], dNdx[b, 3])
+            (dot(ga, τmat * gb)) * w
+        end
+    end)
+end
+
+"""
+    element_force_tangent_finite!(kind, mat, dNdXs, detJw, ue, Xe, εp, β, ᾱ, Cp_inv,
+                                  e, σout, commit=Val(false)) -> (Fe, Ke)
+
+Finite-strain element internal force (SVector{24}) and consistent tangent
+(SMatrix{24,24}) by looping the 8 Gauss points (FINITE_STRAIN §4). `kind` is the
+zero-size `ElementKind` (`Hex8Finite` or `Hex8FiniteFbar`) selecting standard F
+vs F-bar (§5). `dNdXs::SVector{8,SMatrix{8,3}}` are the *reference* shape
+gradients ∂N/∂X, `Xe` the reference node coords (needed for the F-bar centroid
+J₀). `Cp_inv` (6×ngp) is the plastic configuration. `σout` records **Kirchhoff**
+stress (the Model converts to Cauchy on reporting). On `commit=Val(true)` the
+updated plastic history (εp, β, ᾱ, Cp_inv) is written back. Allocation-free.
+"""
+@inline function element_force_tangent_finite!(kind::ElementKind,
+                                               mat::J2Material,
+                                               dNdXs::SVector{8,SMatrix{8,3,Float64,24}},
+                                               detJw::SVector{8,Float64},
+                                               ue::SVector{24,Float64},
+                                               Xe::SMatrix{8,3,Float64,24},
+                                               εp::Matrix{Float64},
+                                               β::Matrix{Float64},
+                                               ᾱ::Vector{Float64},
+                                               Cp_inv::Matrix{Float64},
+                                               e::Int,
+                                               σout::Matrix{Float64},
+                                               ::Val{COMMIT}=Val(false)) where {COMMIT}
+    fbar = kind isa Hex8FiniteFbar
+    # F-bar centroid quantities (FINITE_STRAIN §5): F₀ and J₀ at natural coords
+    # (0,0,0), plus the centroid G-operator for the ∂J₀/∂uₑ coupling.
+    dNdX0 = fbar ? _centroid_ref_grads(Xe) : zero(SMatrix{8,3,Float64,24})
+    F0 = fbar ? deformation_gradient(ue, dNdX0) : I3const
+    J0 = fbar ? det(F0) : 1.0
+    G0 = fbar ? _Gmatrix(dNdX0) : zero(SMatrix{9,24,Float64,216})
+
+    Fe = zero(SVector{24,Float64})
+    Ke = zero(SMatrix{24,24,Float64,576})
+    @inbounds for g in 1:8
+        dNdX = dNdXs[g]
+        w = detJw[g]
+        idx = (e - 1) * 8 + g
+
+        F = deformation_gradient(ue, dNdX)
+        Jg = det(F)
+        # F-bar: replace F by F̄ = (J₀/J)^{1/3} F (volumetric part from centroid).
+        scale = fbar ? (J0 / Jg)^(1 / 3) : 1.0
+        Fbar = fbar ? scale * F : F
+
+        Cpi_n = SVector{6,Float64}(Cp_inv[1, idx], Cp_inv[2, idx], Cp_inv[3, idx],
+                                   Cp_inv[4, idx], Cp_inv[5, idx], Cp_inv[6, idx])
+        kin = finite_kinematics(Fbar, Cpi_n)
+        εp_n = SVector{6,Float64}(εp[1, idx], εp[2, idx], εp[3, idx],
+                                  εp[4, idx], εp[5, idx], εp[6, idx])
+        β_n = SVector{6,Float64}(β[1, idx], β[2, idx], β[3, idx],
+                                 β[4, idx], β[5, idx], β[6, idx])
+        ᾱ_n = ᾱ[idx]
+
+        τ, εp_new, β_new, ᾱ_new, D, τ_princ, Cpi_new =
+            finite_stress_update(mat, kin, εp_n, β_n, ᾱ_n)
+
+        # Two-point (P–F) form (FINITE_STRAIN §4.5): P = τ·F̄⁻ᵀ, A = ∂P/∂F̄ (9×9),
+        # G (9×24) maps uₑ→F via the reference gradients. fe = ∫ Gᵀ P, Ke = ∫ Gᵀ A G
+        # — this automatically contains both material and geometric parts and is
+        # valid for the non-coaxial corrector (combined iso+kin hardening).
+        Gmat = _Gmatrix(dNdX)
+        P = first_piola(τ, kin.Finv)              # 3×3 (from F̄)
+        Pv = _p9(P)
+        A = dPdF(kin, Cpi_n, D, τ, Fbar)          # ∂P/∂F̄
+
+        Fe += (Gmat' * Pv) * w
+        if fbar
+            # chain through F̄(F): Ã = ∂P/∂F = A·∂F̄/∂uₑ including the centroid J₀
+            # coupling (de Souza Neto Box 15.2), as a 9×24 effective G.
+            Geff = _fbar_Geff(Gmat, F, F0, G0, scale)
+            Ke += (Gmat' * (A * Geff)) * w
+        else
+            Ke += (Gmat' * (A * Gmat)) * w
+        end
+
+        # record Kirchhoff stress (Model reports Cauchy σ = τ/J)
+        σout[1, idx] = τ[1]; σout[2, idx] = τ[2]; σout[3, idx] = τ[3]
+        σout[4, idx] = τ[4]; σout[5, idx] = τ[5]; σout[6, idx] = τ[6]
+        if COMMIT
+            εp[1, idx] = εp_new[1]; εp[2, idx] = εp_new[2]; εp[3, idx] = εp_new[3]
+            εp[4, idx] = εp_new[4]; εp[5, idx] = εp_new[5]; εp[6, idx] = εp_new[6]
+            β[1, idx] = β_new[1]; β[2, idx] = β_new[2]; β[3, idx] = β_new[3]
+            β[4, idx] = β_new[4]; β[5, idx] = β_new[5]; β[6, idx] = β_new[6]
+            ᾱ[idx] = ᾱ_new
+            Cp_inv[1, idx] = Cpi_new[1]; Cp_inv[2, idx] = Cpi_new[2]; Cp_inv[3, idx] = Cpi_new[3]
+            Cp_inv[4, idx] = Cpi_new[4]; Cp_inv[5, idx] = Cpi_new[5]; Cp_inv[6, idx] = Cpi_new[6]
+        end
+    end
+    return Fe, Ke
+end
+
+# --- two-point (P–F) element helpers (FINITE_STRAIN §4.5) ---
+
+# G (9×24): ∂F/∂uₑ. F = I + Σₐ uₐ⊗∂Nₐ/∂X ⇒ ∂F_ij/∂u_a^k = δ_ik ∂N_a/∂X_j. The F
+# 9-vector is column-major: index (j-1)*3 + i. Allocation-free.
+@inline function _Gmatrix(dNdX::SMatrix{8,3,Float64,24})
+    return SMatrix{9,24,Float64,216}(ntuple(9 * 24) do idx
+        r = (idx - 1) % 9 + 1          # F component (column-major (j-1)*3+i)
+        c = (idx - 1) ÷ 9 + 1          # local dof
+        i = (r - 1) % 3 + 1
+        j = (r - 1) ÷ 3 + 1
+        a = (c - 1) ÷ 3 + 1
+        k = (c - 1) % 3 + 1
+        (i == k) ? dNdX[a, j] : 0.0
+    end)
+end
+
+# 3×3 P stacked column-major into a 9-vector (matches the G/A layout).
+@inline _p9(P::SMatrix{3,3,Float64,9}) =
+    SVector{9,Float64}(P[1, 1], P[2, 1], P[3, 1], P[1, 2], P[2, 2], P[3, 2], P[1, 3], P[2, 3], P[3, 3])
+
+# centroid reference gradients ∂N/∂X at natural coords (0,0,0) (for F-bar).
+@inline function _centroid_ref_grads(Xe::SMatrix{8,3,Float64,24})
+    dN0 = hex8_dshape(SVector{3,Float64}(0, 0, 0))
+    return dN0 * inv(jacobian(Xe, dN0))
+end
+
+# Effective G for F-bar: ∂F̄/∂uₑ where F̄ = (J₀/J)^{1/3} F (de Souza Neto Box 15.2).
+# ∂F̄/∂uₑ = scale·G + (scale/3)·vec(F)·(g₀ − g_J)ᵀ, with g_J = ∂lnJ/∂uₑ =
+# vec(F⁻ᵀ)ᵀ·G and g₀ = ∂lnJ₀/∂uₑ = vec(F₀⁻ᵀ)ᵀ·G₀ (centroid). Allocation-free.
+@inline function _fbar_Geff(Gmat::SMatrix{9,24,Float64,216}, F::SMatrix{3,3,Float64,9},
+                            F0::SMatrix{3,3,Float64,9},
+                            G0::SMatrix{9,24,Float64,216}, scale::Float64)
+    gJ = Gmat' * _p9(inv(F)')               # ∂lnJ/∂uₑ  (24-vector)
+    g0 = G0' * _p9(inv(F0)')                # ∂lnJ₀/∂uₑ (24-vector)
+    vF = _p9(F)
+    return scale * Gmat + (scale / 3) * (vF * (g0 - gJ)')
 end
 
 end # module

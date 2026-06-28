@@ -6,7 +6,7 @@ See DESIGN.md §4.2.
 """
 module MeshMod
 
-export Mesh, box_mesh, select_nodes, on_face, dof, GaussState
+export Mesh, box_mesh, select_nodes, on_face, dof, GaussState, reset_state!
 
 """
     Mesh
@@ -116,22 +116,50 @@ Global DOF index of (node, component): 3(node−1)+comp, comp∈{1,2,3} (DESIGN 
 Struct-of-arrays per-Gauss-point state, sized over ngp_total = nelem×8
 (DESIGN §4.3). `εp` engineering-shear Voigt plastic strain, `β` back-stress
 deviator (physical shear), `ᾱ` accumulated plastic strain, `σ` stress (output).
+
+`Cp_inv` (6×ngp, symmetric Voigt, physical shear) is the finite-strain plastic
+configuration Cᵖ⁻¹ = Fᵖ⁻¹Fᵖ⁻ᵀ, initialized to the identity `[1,1,1,0,0,0]`
+(FINITE_STRAIN §6.2). Small-strain models leave it at identity (unused).
 """
 struct GaussState
     εp::Matrix{Float64}   # 6 × ngp
     β::Matrix{Float64}    # 6 × ngp
     ᾱ::Vector{Float64}    # ngp
     σ::Matrix{Float64}    # 6 × ngp
+    Cp_inv::Matrix{Float64}   # 6 × ngp  (finite strain; identity for small strain)
 end
 
-GaussState(ngp::Int) = GaussState(zeros(6, ngp), zeros(6, ngp), zeros(ngp), zeros(6, ngp))
+function GaussState(ngp::Int)
+    Cp_inv = zeros(6, ngp)
+    @inbounds for g in 1:ngp
+        Cp_inv[1, g] = 1.0; Cp_inv[2, g] = 1.0; Cp_inv[3, g] = 1.0
+    end
+    return GaussState(zeros(6, ngp), zeros(6, ngp), zeros(ngp), zeros(6, ngp), Cp_inv)
+end
 
 function Base.copyto!(dst::GaussState, src::GaussState)
     copyto!(dst.εp, src.εp)
     copyto!(dst.β, src.β)
     copyto!(dst.ᾱ, src.ᾱ)
     copyto!(dst.σ, src.σ)
+    copyto!(dst.Cp_inv, src.Cp_inv)
     return dst
+end
+
+"""
+    reset_state!(st)
+
+Reset a `GaussState` to the undeformed, unhardened state: zero `εp,β,ᾱ,σ` and
+set `Cp_inv` to the identity `[1,1,1,0,0,0]` per Gauss point (FINITE_STRAIN §6.2).
+"""
+function reset_state!(st::GaussState)
+    fill!(st.εp, 0.0); fill!(st.β, 0.0); fill!(st.ᾱ, 0.0); fill!(st.σ, 0.0)
+    fill!(st.Cp_inv, 0.0)
+    ngp = length(st.ᾱ)
+    @inbounds for g in 1:ngp
+        st.Cp_inv[1, g] = 1.0; st.Cp_inv[2, g] = 1.0; st.Cp_inv[3, g] = 1.0
+    end
+    return st
 end
 
 end # module

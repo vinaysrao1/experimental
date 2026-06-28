@@ -13,6 +13,7 @@ module PlasticityFEM
 
 include("Materials.jl")
 include("Mesh.jl")
+include("FiniteStrain.jl")
 include("Elements.jl")
 include("BoundaryConditions.jl")
 include("Assembly.jl")
@@ -22,6 +23,7 @@ include("Visualization.jl")
 
 using .Materials
 using .MeshMod
+using .FiniteStrain
 using .Elements
 using .BoundaryConditions
 using .Assembly
