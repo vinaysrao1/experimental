@@ -22,7 +22,9 @@ module Assembly
 using SparseArrays
 using StaticArrays
 using ..MeshMod: Mesh, dof
-using ..Elements: ElementCache, element_force_tangent!, element_geometry
+using ..Elements: ElementCache, element_force_tangent!, element_force_tangent_finite!,
+    element_geometry, element_ref_grads, element_coords
+using ..FiniteStrain: ElementKind, Hex8Small, Hex8Finite, Hex8FiniteFbar
 using ..Materials: J2Material
 
 export SparsityPattern, build_sparsity, assemble!, assemble_threaded!
@@ -237,23 +239,27 @@ function assemble!(sp::SparsityPattern, mat::J2Material, cache::ElementCache,
                    U::Vector{Float64},
                    εp::Matrix{Float64}, β::Matrix{Float64}, ᾱ::Vector{Float64},
                    σ::Matrix{Float64}, R::Vector{Float64};
-                   commit::Bool=false)
+                   commit::Bool=false,
+                   kind::ElementKind=Hex8Small(),
+                   Cp_inv::Union{Matrix{Float64},Nothing}=nothing)
     # Resolve `commit` to a *statically typed* Val via an explicit branch (not
     # `Val(commit)`, which would be a runtime-typed Union forcing a dynamic
     # dispatch that boxes the SparseMatrixCSC return — ~10 kB). The explicit
     # branch keeps both call sites fully inferred and the assembly O(1)-alloc,
-    # preserving the v1 T20 `@allocated` bound.
+    # preserving the v1 T20 `@allocated` bound. `kind` (a zero-size ElementKind)
+    # statically selects the small- vs finite-strain element kernel.
+    Cpi = Cp_inv === nothing ? σ : Cp_inv   # σ is a harmless placeholder for small
     if commit
-        return _assemble!(sp, mat, cache, U, εp, β, ᾱ, σ, R, Val(true))
+        return _assemble!(sp, mat, kind, cache, U, εp, β, ᾱ, σ, Cpi, R, Val(true))
     else
-        return _assemble!(sp, mat, cache, U, εp, β, ᾱ, σ, R, Val(false))
+        return _assemble!(sp, mat, kind, cache, U, εp, β, ᾱ, σ, Cpi, R, Val(false))
     end
 end
 
-function _assemble!(sp::SparsityPattern, mat::J2Material, cache::ElementCache,
-                    U::Vector{Float64},
+function _assemble!(sp::SparsityPattern, mat::J2Material, kind::ElementKind,
+                    cache::ElementCache, U::Vector{Float64},
                     εp::Matrix{Float64}, β::Matrix{Float64}, ᾱ::Vector{Float64},
-                    σ::Matrix{Float64}, R::Vector{Float64},
+                    σ::Matrix{Float64}, Cp_inv::Matrix{Float64}, R::Vector{Float64},
                     cv::Val{COMMIT}) where {COMMIT}
     fill!(sp.K.nzval, 0.0)
     fill!(R, 0.0)
@@ -261,9 +267,9 @@ function _assemble!(sp::SparsityPattern, mat::J2Material, cache::ElementCache,
     # to a compile-time Val, so the inner loop has no geometry branch / type union
     # and stays allocation-free per element (SCALING.md §2.2, §2.6).
     if cache.uniform
-        _assemble_loop!(sp, mat, cache, U, εp, β, ᾱ, σ, R, cv, Val(true))
+        _assemble_loop!(sp, mat, kind, cache, U, εp, β, ᾱ, σ, Cp_inv, R, cv, Val(true))
     else
-        _assemble_loop!(sp, mat, cache, U, εp, β, ᾱ, σ, R, cv, Val(false))
+        _assemble_loop!(sp, mat, kind, cache, U, εp, β, ᾱ, σ, Cp_inv, R, cv, Val(false))
     end
     return sp.K, R
 end
@@ -275,11 +281,30 @@ end
     return element_geometry(cache, e)
 end
 
-function _assemble_loop!(sp::SparsityPattern, mat::J2Material, cache::ElementCache,
-                         U::Vector{Float64},
+# Per-element (Fe, Ke) dispatched on the ElementKind (static; no runtime branch).
+# Small-strain reuses the v1 spatial B-matrix kernel; finite strain uses the
+# reference shape gradients + the two-point P–F kernel (FINITE_STRAIN §4–5).
+@inline function _elem_contribution(::Hex8Small, mat::J2Material, cache::ElementCache,
+                                    e::Int, ue::SVector{24,Float64},
+                                    εp, β, ᾱ, σ, Cp_inv, ::Val{COMMIT}, uv) where {COMMIT}
+    Bs, detJw = _elem_geom(cache, e, uv)
+    return element_force_tangent!(mat, Bs, detJw, ue, εp, β, ᾱ, e, σ, Val(COMMIT))
+end
+@inline function _elem_contribution(kind::ElementKind, mat::J2Material, cache::ElementCache,
+                                    e::Int, ue::SVector{24,Float64},
+                                    εp, β, ᾱ, σ, Cp_inv, ::Val{COMMIT}, uv) where {COMMIT}
+    dNdXs = element_ref_grads(cache, e)
+    _, detJw = _elem_geom(cache, e, uv)
+    Xe = element_coords(cache.nodes, cache.elements, e)
+    return element_force_tangent_finite!(kind, mat, dNdXs, detJw, ue, Xe,
+                                         εp, β, ᾱ, Cp_inv, e, σ, Val(COMMIT))
+end
+
+function _assemble_loop!(sp::SparsityPattern, mat::J2Material, kind::ElementKind,
+                         cache::ElementCache, U::Vector{Float64},
                          εp::Matrix{Float64}, β::Matrix{Float64}, ᾱ::Vector{Float64},
-                         σ::Matrix{Float64}, R::Vector{Float64},
-                         ::Val{COMMIT}, uv::Val{UNIFORM}) where {COMMIT,UNIFORM}
+                         σ::Matrix{Float64}, Cp_inv::Matrix{Float64}, R::Vector{Float64},
+                         cv::Val{COMMIT}, uv::Val{UNIFORM}) where {COMMIT,UNIFORM}
     nzval = sp.K.nzval
     colptr = sp.K.colptr
     rowval = sp.K.rowval
@@ -287,9 +312,7 @@ function _assemble_loop!(sp::SparsityPattern, mat::J2Material, cache::ElementCac
     nelem = size(edofs, 2)
     @inbounds for e in 1:nelem
         ue = SVector{24,Float64}(ntuple(i -> U[edofs[i, e]], Val(24)))
-        Bs, detJw = _elem_geom(cache, e, uv)
-        Fe, Ke = element_force_tangent!(mat, Bs, detJw, ue,
-                                        εp, β, ᾱ, e, σ, Val(COMMIT))
+        Fe, Ke = _elem_contribution(kind, mat, cache, e, ue, εp, β, ᾱ, σ, Cp_inv, cv, uv)
         # scatter K via on-the-fly CSC column binary search (SCALING.md §2.3)
         for c in 1:24
             gcol = edofs[c, e]
@@ -318,48 +341,51 @@ function assemble_threaded!(sp::SparsityPattern, mat::J2Material, cache::Element
                             U::Vector{Float64},
                             εp::Matrix{Float64}, β::Matrix{Float64}, ᾱ::Vector{Float64},
                             σ::Matrix{Float64}, R::Vector{Float64};
-                            commit::Bool=false)
+                            commit::Bool=false,
+                            kind::ElementKind=Hex8Small(),
+                            Cp_inv::Union{Matrix{Float64},Nothing}=nothing)
     # Static Val branch (see `assemble!`): avoids dynamic-dispatch boxing.
+    Cpi = Cp_inv === nothing ? σ : Cp_inv
     if commit
-        return _assemble_threaded_entry!(sp, mat, cache, U, εp, β, ᾱ, σ, R, Val(true))
+        return _assemble_threaded_entry!(sp, mat, kind, cache, U, εp, β, ᾱ, σ, Cpi, R, Val(true))
     else
-        return _assemble_threaded_entry!(sp, mat, cache, U, εp, β, ᾱ, σ, R, Val(false))
+        return _assemble_threaded_entry!(sp, mat, kind, cache, U, εp, β, ᾱ, σ, Cpi, R, Val(false))
     end
 end
 
-function _assemble_threaded_entry!(sp::SparsityPattern, mat::J2Material, cache::ElementCache,
-                                   U::Vector{Float64},
+function _assemble_threaded_entry!(sp::SparsityPattern, mat::J2Material, kind::ElementKind,
+                                   cache::ElementCache, U::Vector{Float64},
                                    εp::Matrix{Float64}, β::Matrix{Float64}, ᾱ::Vector{Float64},
-                                   σ::Matrix{Float64}, R::Vector{Float64},
+                                   σ::Matrix{Float64}, Cp_inv::Matrix{Float64}, R::Vector{Float64},
                                    cv::Val{COMMIT}) where {COMMIT}
     fill!(sp.K.nzval, 0.0)
     fill!(R, 0.0)
-    _assemble_threaded!(sp, mat, cache, U, εp, β, ᾱ, σ, R, cv)
+    _assemble_threaded!(sp, mat, kind, cache, U, εp, β, ᾱ, σ, Cp_inv, R, cv)
     return sp.K, R
 end
 
 # Race-free threaded assembly: for each color (whose elements share no node, so
 # they write disjoint nzval/R entries) thread over its element list. R is also
 # race-free because same-color elements own disjoint DOFs (SCALING.md §3.1).
-function _assemble_threaded!(sp::SparsityPattern, mat::J2Material, cache::ElementCache,
-                             U::Vector{Float64},
+function _assemble_threaded!(sp::SparsityPattern, mat::J2Material, kind::ElementKind,
+                             cache::ElementCache, U::Vector{Float64},
                              εp::Matrix{Float64}, β::Matrix{Float64}, ᾱ::Vector{Float64},
-                             σ::Matrix{Float64}, R::Vector{Float64},
+                             σ::Matrix{Float64}, Cp_inv::Matrix{Float64}, R::Vector{Float64},
                              ::Val{COMMIT}) where {COMMIT}
     for color in sp.colors
         Threads.@threads for ci in eachindex(color)
             e = color[ci]
-            _assemble_one!(sp, mat, cache, U, εp, β, ᾱ, σ, R, Val(COMMIT), e)
+            _assemble_one!(sp, mat, kind, cache, U, εp, β, ᾱ, σ, Cp_inv, R, Val(COMMIT), e)
         end
     end
     return nothing
 end
 
 # Assemble a single element e (used by the threaded path). Allocation-free.
-@inline function _assemble_one!(sp::SparsityPattern, mat::J2Material, cache::ElementCache,
-                                U::Vector{Float64},
+@inline function _assemble_one!(sp::SparsityPattern, mat::J2Material, kind::ElementKind,
+                                cache::ElementCache, U::Vector{Float64},
                                 εp::Matrix{Float64}, β::Matrix{Float64}, ᾱ::Vector{Float64},
-                                σ::Matrix{Float64}, R::Vector{Float64},
+                                σ::Matrix{Float64}, Cp_inv::Matrix{Float64}, R::Vector{Float64},
                                 ::Val{COMMIT}, e::Integer) where {COMMIT}
     nzval = sp.K.nzval
     colptr = sp.K.colptr
@@ -367,9 +393,8 @@ end
     edofs = sp.edofs
     @inbounds begin
         ue = SVector{24,Float64}(ntuple(i -> U[edofs[i, e]], Val(24)))
-        Bs, detJw = element_geometry(cache, e)
-        Fe, Ke = element_force_tangent!(mat, Bs, detJw, ue,
-                                        εp, β, ᾱ, e, σ, Val(COMMIT))
+        Fe, Ke = _elem_contribution(kind, mat, cache, e, ue, εp, β, ᾱ, σ, Cp_inv,
+                                    Val(COMMIT), Val(cache.uniform))
         for c in 1:24
             gcol = edofs[c, e]
             colstart = colptr[gcol]

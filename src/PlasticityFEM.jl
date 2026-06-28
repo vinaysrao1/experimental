@@ -35,9 +35,11 @@ using .Visualization
 export box_mesh, on_face, select_nodes
 export J2Material
 export Model, fix!, prescribe!, load!, solve!, reset!
-export nodal_displacements, gauss_stress, equivalent_plastic_strain
+export nodal_displacements, gauss_stress, gauss_kirchhoff, equivalent_plastic_strain
 export write_vtu, gauss_strain, von_mises
 export SolveResult
+# finite-strain element-kind selectors (FINITE_STRAIN §6.1, §6.4)
+export ElementKind, Hex8Small, Hex8Finite, Hex8FiniteFbar
 
 # Re-export selected internals useful for tests / advanced use.
 export return_map, precompute_cache, element_geometry, element_force_tangent!,

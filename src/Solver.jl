@@ -249,10 +249,12 @@ end
                                R::Vector{Float64}, threaded::Bool, commit::Bool)
     if threaded
         return assemble_threaded!(model.sparsity, model.material, model.cache, U,
-                                  st.εp, st.β, st.ᾱ, st.σ, R; commit=commit)
+                                  st.εp, st.β, st.ᾱ, st.σ, R; commit=commit,
+                                  kind=model.kind, Cp_inv=st.Cp_inv)
     else
         return assemble!(model.sparsity, model.material, model.cache, U,
-                         st.εp, st.β, st.ᾱ, st.σ, R; commit=commit)
+                         st.εp, st.β, st.ᾱ, st.σ, R; commit=commit,
+                         kind=model.kind, Cp_inv=st.Cp_inv)
     end
 end
 
