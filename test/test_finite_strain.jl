@@ -383,3 +383,41 @@ end
     # bounded by a small constant independent of nelem (allow modest overhead)
     @test a3 <= a2 + 2048
 end
+
+@testset "F12 spatial modulus + geometric stiffness == production tangent (§4.3/§4.4)" begin
+    # Wires the reference spatial-form modulus `spatial_modulus` (§4.3 g_AB) and
+    # `geometric_stiffness` (§4.4) and checks they reconstruct the production
+    # two-point (dPdF) element tangent for the ISOTROPIC COAXIAL case, where the
+    # spatial form is exact (Simo & Hughes Box 8.2 / de Souza Neto Box 14.3):
+    #   Ke = Σ_gp [ Bᵀ a B + Kᵍ ] (detJ₀·w),  a from spatial_modulus, Kᵍ from
+    #        geometric_stiffness, B the spatial B-matrix at dNdx = dNdX·F⁻¹.
+    _, dNdXs, detJw, Xe, X = _unit_element()
+    EL = PlasticityFEM.Elements
+    # Elastic, coaxial (diagonal F, diagonal Cᵖ⁻¹ = I ⇒ coaxial bᵉ_tr): the
+    # reference spatial form is EXACT here ⇒ machine-precision agreement.
+    mat = J2Material(E=210e3, ν=0.3, σy0=1e9)            # stays elastic
+    F = SMatrix{3,3,Float64,9}(1.12, 0, 0, 0, 0.95, 0, 0, 0, 0.97)
+    ue = _ue_from_F(X, F)
+    Cp = _cp_identity()
+    _, Ke_prod = _fe_ke(Hex8Finite(), mat, dNdXs, detJw, Xe, ue,
+                        zeros(6, 8), zeros(6, 8), zeros(8), Cp)
+    Z6 = zero(SVector{6,Float64})
+    function spatial_Ke()
+        Ks = zero(SMatrix{24,24,Float64,576})
+        for g in 1:8
+            dNdX = dNdXs[g]; w = detJw[g]
+            Fg = FS.deformation_gradient(ue, dNdX)
+            Cpi = SVector{6,Float64}(Cp[1, g], Cp[2, g], Cp[3, g], Cp[4, g], Cp[5, g], Cp[6, g])
+            kin = FS.finite_kinematics(Fg, Cpi)
+            τ, _, _, _, D, τpr, _, _, _, _ = FS.finite_stress_update(mat, kin, Fg, Z6, Z6, 0.0)
+            a = FS.spatial_modulus(kin, τpr, D)
+            dNdx = dNdX * inv(Fg)                        # spatial gradients ∂N/∂x
+            B = EL.bmatrix(dNdx)
+            Kg = EL.geometric_stiffness(dNdx, FS.voigt_to_sym3(τ), w)
+            Ks += (B' * a * B) * w + Kg
+        end
+        return Ks
+    end
+    Ke_sp = spatial_Ke()
+    @test norm(Matrix(Ke_sp) - Matrix(Ke_prod)) / norm(Matrix(Ke_prod)) < 1e-10
+end

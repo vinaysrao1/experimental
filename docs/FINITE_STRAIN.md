@@ -189,6 +189,32 @@ the additive small-strain split only approximates.
 > reconstruct `bᵉ_{n+1}` directly from the corrected principal values. Either
 > form is acceptable provided the `det Fᵖ = 1` test (§7) passes to ~1e-12.
 
+### 3.4 Objective kinematic hardening (rotation-neutralized back-stress)
+Frame-indifference (objectivity) requires that under a superposed spatial rotation
+`Q` (`F → QF`) the Kirchhoff stress rotate as `τ → Q τ Qᵀ`. The trial Hencky
+strain already does: eigenvalues of `bᵉ_tr = F Cᵖ⁻¹ Fᵀ` are `Q`-invariant and the
+eigenvectors co-rotate. **But a back-stress stored in the global spatial frame does
+NOT co-rotate**, so `ξ = s − β` uses `β` in the wrong frame and the model is
+non-objective — up to ~17% Cauchy-stress error at large `Q` with `Hkin > 0` (an
+adversarial F4 check exposes this).
+
+Fix (de Souza Neto §14 / Simo & Hughes): store the back-stress in the
+**rotation-neutralized (reference) configuration** `β_ref`, which — like `Cᵖ⁻¹` —
+is `Q`-invariant. Inside the stress update, push it forward to the spatial frame
+with the **polar rotation** `R` of `F` (`F = R U`):
+
+```
+β_sp = R · β_ref · Rᵀ      (spatial back-stress for the return map)
+... return_map(εᵉ_tr, β_sp) → τ, β_sp_{n+1} ...
+β_ref_{n+1} = Rᵀ · β_sp_{n+1} · R    (pull the update back to reference, stored)
+```
+
+Under `F → QF`, `R → QR`, so `β_sp → Q β_sp Qᵀ` and hence `τ → Q τ Qᵀ` — exact
+objectivity (error ~1e-15 even at 120°, F4b). For isotropic / perfect plasticity
+(`Hkin = 0`) `β_ref ≡ 0`, so `β_sp = 0` for any `R` and the polar decomposition is
+skipped entirely (the path reduces to the original symmetric one). The consistent
+tangent for this term is given in §4.6.
+
 ---
 
 ## 4. Element internal force and consistent tangent
@@ -218,11 +244,36 @@ Kᵉ = Kᵉ_material + Kᵉ_geometric
   stress with the gradient of the test/trial functions (§4.4). It is what makes
   finite rotations and buckling correct and Newton quadratic.
 
-> Both parts are **symmetric** for associative J2 (D is symmetric; the
-> push-forward and initial-stress operators preserve symmetry). Therefore the
-> global K stays symmetric and the CG+AMG solver and `SymThreadedK` SpMV
-> (SCALING §3.2) remain valid **unchanged**. The implementation MUST preserve
-> this; assert symmetry of `Kᵉ` in tests.
+> **Tangent symmetry — when K = Kᵀ, and when it is not.** Symmetry is *not*
+> universal here; it depends on the element kind and the hardening:
+>
+> | configuration | tangent | linear solver (auto) |
+> |---|---|---|
+> | small strain (`:small`) | **symmetric** | CG + AMG |
+> | finite strain (`:finite`), isotropic / perfect (Hkin = 0) | **symmetric** | CG + AMG |
+> | finite strain (`:finite`), **kinematic hardening** (Hkin > 0) | **non-symmetric** | direct (UMFPACK) |
+> | **F-bar** (`:finite_fbar`), any material | **non-symmetric** (always) | direct (UMFPACK) |
+>
+> For the symmetric cases the production two-point form `K = ∫ Gᵀ A G dV` is
+> symmetric (the §4.3 material part + §4.4 initial-stress part both preserve
+> symmetry for the coaxial associative-J2 response), and the CG + AMG solver and
+> the row-parallel `SymThreadedK` SpMV (SCALING §3.2) apply unchanged.
+>
+> Two effects break symmetry. (1) **F-bar**: the `∂F̄/∂uₑ` centroid-J₀ coupling
+> (`_fbar_Geff`, de Souza Neto Box 15.2) is a rank-one non-symmetric operator, so
+> the F-bar tangent is non-symmetric for *any* material. (2) **Objective kinematic
+> hardening** (§4.6): the back-stress is stored in the reference configuration and
+> pushed to the spatial frame by the polar rotation `R(F)` (the fix that makes the
+> law frame-indifferent, §3.4); the resulting `∂τ/∂β_sp · ∂β_sp/∂F` term is
+> non-symmetric. We **prioritize objectivity over symmetry** — the non-symmetric
+> tangent is fully *consistent* (FD-verified <1e-6, Newton stays quadratic).
+>
+> Because the tangent can be non-symmetric, `solve!` is **symmetry-aware**: it
+> inspects the element kind + `Hkin` and auto-selects CG (symmetric) or the direct
+> UMFPACK solve (non-symmetric). Forcing `linsolve=:cg` on a non-symmetric
+> configuration warns and overrides to `:direct` (CG/AMG/SymThreadedK all assume
+> K = Kᵀ). Tests assert symmetry only for the symmetric configurations (F9) and
+> assert consistency-but-non-symmetry for the kinematic case (F9b).
 
 ### 4.3 Spatial material modulus `a` (principal-axis form)
 With principal Kirchhoff stresses `τ_A`, trial eigenvalues `b_A = (λᵉ_tr_A)²`,
@@ -290,6 +341,34 @@ stress, `G` (9×24) maps `uₑ → F` via the **reference** gradients (cacheable
 It is a valid alternative; the spatial form §4.1–4.4 is the **primary**
 specification because it maximizes reuse of the v1 `bmatrix`/Voigt code. Whichever
 is implemented, the FD gate §7 applies.
+
+> **Implementation note.** The production element kernel uses this two-point
+> (P–F) form (`dPdF`), not the spatial form, because it is also valid for the
+> non-coaxial corrector of kinematic hardening. The spatial form §4.3/§4.4
+> (`spatial_modulus` + `geometric_stiffness`) is retained as the reference
+> derivation and is unit-tested to reproduce `dPdF` to machine precision for the
+> isotropic coaxial case (F12).
+
+### 4.6 Tangent term for objective kinematic hardening
+With the rotation-neutralized back-stress (§3.4) the spatial back-stress
+`β_sp = R(F)·β_ref·Rᵀ` depends on `F` through the polar rotation, so the consistent
+tangent gains
+
+```
+∂τ/∂F |_β = (∂τ/∂β_sp) · (∂β_sp/∂F)
+```
+
+- `∂τ/∂β_sp` (`dtau_dbeta`): at fixed trial strain the plastic corrector is
+  `c(ξ) = a·ξ`, `ξ = s_tr − β_sp`, `a = 2G√(3/2)Δγ/‖ξ‖`. Since `τ = σ_tr − c` and
+  `∂ξ/∂β = −I`, `∂τ/∂β = ∂c/∂ξ = a·I + ξ⊗(∂a/∂β)` (zero in the elastic branch).
+  FD-verified ~1e-10.
+- `∂β_sp/∂F`: from `β_sp = R β_ref Rᵀ` with the **polar-rotation derivative**
+  `Ṙ` (`dR_polar`), obtained by solving the Sylvester equation `Ω U + U Ω =
+  RᵀḞ − ḞᵀR` for the skew `Ω = RᵀṘ` in `U`'s eigenbasis.
+
+This term is non-symmetric (see §4.2) but makes the full tangent consistent
+(`dPdF` FD-verified <1e-6, F9b). It is added inside `dPdF` and is inactive when
+`Hkin = 0`.
 
 ---
 
