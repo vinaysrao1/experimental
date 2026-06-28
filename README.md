@@ -221,11 +221,14 @@ log-strain space. The consistent tangent is the first-Piola/`F` form
 - For finite-strain models `gauss_stress` reports the **Cauchy** stress
   `σ = τ/J`; `gauss_kirchhoff` returns the raw Kirchhoff stress `τ`. VTK output
   warps by the displacement vector to show the true deformed shape.
-- Notes: with **kinematic** hardening (and for **F-bar**) the finite-strain
-  algorithmic tangent is slightly non-symmetric (~1e-4 / ~1e-2 respectively),
-  an inherent property of those formulations; use `linsolve=:direct` for those
-  cases. Standard finite strain with isotropic/perfect plasticity yields a
-  symmetric tangent. See `docs/FINITE_STRAIN.md`.
+- Notes on tangent symmetry: standard finite strain with isotropic/perfect
+  plasticity yields a **symmetric** tangent (CG + AMG). With **kinematic**
+  hardening the objective (frame-indifferent) back-stress rotation, and for
+  **F-bar** the centroid-J₀ coupling, make the tangent **non-symmetric** (~1e-5
+  and ~1e-2 respectively) — an inherent property of those formulations. `solve!`
+  is symmetry-aware: its default `linsolve=:auto` picks CG for the symmetric cases
+  and the direct UMFPACK solver for the non-symmetric ones (forcing `:cg` on a
+  non-symmetric config warns and overrides to `:direct`). See `docs/FINITE_STRAIN.md`.
 
 ## Scope
 
