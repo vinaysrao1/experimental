@@ -18,6 +18,7 @@ using LinearAlgebra
 using Krylov: CgWorkspace, cg!
 using AlgebraicMultigrid: smoothed_aggregation, ruge_stuben, aspreconditioner, Jacobi
 using ..MeshMod: GaussState
+using ..FiniteStrain: Hex8Small, Hex8Finite, Hex8FiniteFbar
 using ..BoundaryConditions: DirichletBC, NeumannBC, impose_dirichlet!, assemble_neumann!
 using ..Assembly: assemble!, assemble_threaded!
 using ..ModelMod: Model, reset!
@@ -169,6 +170,22 @@ function _forcing_term(ls::LinearSolveState, it::Int, rk::Float64,
     return clamp(η, ls.η_min, ls.η_max)
 end
 
+# --- tangent symmetry (SCALING §3.2 / FINITE_STRAIN §4.2) ---
+#
+# CG + AMG (with the rigid-body near-null-space) + the row-parallel `SymThreadedK`
+# SpMV ALL assume K = Kᵀ. The finite-strain consistent tangent is symmetric only
+# for small strain, or finite strain with NO kinematic hardening (isotropic /
+# perfect plasticity). It is NON-symmetric for:
+#   • F-bar (Hex8FiniteFbar) — always (the centroid J₀ coupling is non-symmetric);
+#   • finite strain with kinematic hardening (Hkin > 0) — the objective back-stress
+#     rotation contributes a non-symmetric ∂τ/∂β·∂β_sp/∂F term (FINITE_STRAIN §4.6).
+# For those, CG is invalid (cg! raises an SPD error); we must use a direct solve.
+@inline _tangent_symmetric(model::Model) =
+    _kind_symmetric(model.kind, model.material.Hkin)
+@inline _kind_symmetric(::Hex8Small, ::Float64)      = true
+@inline _kind_symmetric(::Hex8Finite, Hkin::Float64) = Hkin == 0.0
+@inline _kind_symmetric(::Hex8FiniteFbar, ::Float64) = false
+
 # Build the frozen BC objects from the model accumulators.
 # Dirichlet is split into ramped (prescribed) and non-ramped (fixed) sets so a
 # single `ramp` bool per DirichletBC suffices (DESIGN §4.5).
@@ -200,6 +217,18 @@ function _freeze_bcs(model::Model)
     return dir_ramp, dir_fix, neu
 end
 
+# Classify a CG error: true iff it is the non-SPD / "positive definite" failure
+# `cg!` raises on a non-symmetric / indefinite tangent (the only case for which a
+# direct fallback is the right recovery). InterruptException (Ctrl-C) and genuine
+# CG misconfiguration errors are NOT this and must propagate (S1). We match on the
+# rendered message because Krylov surfaces this as a plain error type.
+function _is_non_spd_error(err::Exception)
+    err isa InterruptException && return false
+    msg = sprint(showerror, err)
+    return occursin("positive definite", msg) || occursin("not symmetric", msg) ||
+           occursin("indefinite", msg)
+end
+
 # Solve K δU = b into δU. CG+AMG by default, with a refresh-on-stall fallback;
 # `:direct` uses UMFPACK. Returns the number of CG iterations (0 for direct).
 # `rebuild_pc` forces an AMG rebuild before solving (start of a load step).
@@ -222,7 +251,17 @@ function _linear_solve!(δU::Vector{Float64}, K::SparseMatrixCSC, b::Vector{Floa
     # (K is symmetric after `impose_dirichlet!`), else the plain CSC matrix. The
     # AMG preconditioner is always built from the underlying sparse K.
     A = ls.threaded ? SymThreadedK(K) : K
-    cg!(ls.ws, A, b; M=ls.Pl, ldiv=true, atol=0.0, rtol=rtol, itmax=ls.cg_itmax)
+    # Guard: cg! raises an SPD error (rather than returning !solved) if K or M is
+    # not symmetric positive definite. Catch it and fall back to a direct solve so
+    # an unexpectedly non-symmetric tangent can never crash the Newton loop.
+    try
+        cg!(ls.ws, A, b; M=ls.Pl, ldiv=true, atol=0.0, rtol=rtol, itmax=ls.cg_itmax)
+    catch err
+        _is_non_spd_error(err) || rethrow()
+        @warn "CG raised $(typeof(err)) ($(sprint(showerror, err))); falling back to direct solve" maxlog=5
+        δU .= K \ b
+        return 0
+    end
     stats = ls.ws.stats
     niter = stats.niter
 
@@ -230,7 +269,14 @@ function _linear_solve!(δU::Vector{Float64}, K::SparseMatrixCSC, b::Vector{Floa
     # and retry once if CG failed to converge (stall / itmax hit).
     if !stats.solved
         ls.Pl = _build_amg(K, ls)
-        cg!(ls.ws, A, b; M=ls.Pl, ldiv=true, atol=0.0, rtol=rtol, itmax=ls.cg_itmax)
+        try
+            cg!(ls.ws, A, b; M=ls.Pl, ldiv=true, atol=0.0, rtol=rtol, itmax=ls.cg_itmax)
+        catch err
+            _is_non_spd_error(err) || rethrow()
+            @warn "CG raised $(typeof(err)) on retry ($(sprint(showerror, err))); falling back to direct solve" maxlog=5
+            δU .= K \ b
+            return niter
+        end
         stats = ls.ws.stats
         niter += stats.niter
         if !stats.solved
@@ -249,10 +295,12 @@ end
                                R::Vector{Float64}, threaded::Bool, commit::Bool)
     if threaded
         return assemble_threaded!(model.sparsity, model.material, model.cache, U,
-                                  st.εp, st.β, st.ᾱ, st.σ, R; commit=commit)
+                                  st.εp, st.β, st.ᾱ, st.σ, R; commit=commit,
+                                  kind=model.kind, Cp_inv=st.Cp_inv)
     else
         return assemble!(model.sparsity, model.material, model.cache, U,
-                         st.εp, st.β, st.ᾱ, st.σ, R; commit=commit)
+                         st.εp, st.β, st.ᾱ, st.σ, R; commit=commit,
+                         kind=model.kind, Cp_inv=st.Cp_inv)
     end
 end
 
@@ -342,27 +390,57 @@ end
 
 """
     solve!(model; nsteps=10, tol=1e-8, maxiter=25, verbose=false,
-           linsolve=:cg, amg=:sa, smoother=:gs, cg_itmax=200) -> SolveResult
+           linsolve=:auto, amg=:sa, smoother=:gs, cg_itmax=200) -> SolveResult
 
 Load-stepped Newton driver (DESIGN §1.5, §6.3). Ramps λ = 1/N … 1, Newton-
 iterates each step, and commits the per-GP state on convergence (plasticity is
 path dependent).
 
 Linear-solver keywords (SCALING.md §1):
-- `linsolve` — `:cg` (PCG+AMG, default) or `:direct` (UMFPACK `\\`).
+- `linsolve` — `:auto` (default), `:cg` (PCG+AMG) or `:direct` (UMFPACK `\\`).
+  CG + AMG + the row-parallel `SymThreadedK` SpMV all assume a SYMMETRIC tangent
+  K = Kᵀ. `:auto` inspects the element kind + material and picks the right solver:
+    • `:small`, or `:finite` with **no kinematic hardening** (Hkin = 0) ⇒ symmetric
+      ⇒ CG + AMG;
+    • `:finite_fbar` (always), or `:finite` with `Hkin > 0` ⇒ NON-symmetric tangent
+      (F-bar's centroid coupling; the objective back-stress rotation, FINITE_STRAIN
+      §4.2/§4.6) ⇒ `:direct` (UMFPACK).
+  Forcing `linsolve=:cg` on a non-symmetric configuration is unsafe (`cg!` raises
+  an SPD error); `solve!` WARNS and overrides to `:direct` in that case. The inner
+  solve is additionally guarded so any thrown SPD error falls back to direct.
 - `amg` — `:sa` smoothed aggregation (default) or `:rs` Ruge–Stüben.
 - `smoother` — `:gs` Gauss–Seidel (AMG default) or `:jacobi` (thread-parallel).
 - `cg_itmax` — inner CG iteration cap (default 200).
 - `threaded` — 8-color threaded assembly + row-parallel SpMV (default: on when
-  `Threads.nthreads() > 1`). Results are identical to the serial path.
+  `Threads.nthreads() > 1`). The row-parallel SpMV is only used on the symmetric
+  CG path; the direct path assembles the full (possibly non-symmetric) K. Results
+  are identical to the serial path.
 """
 function solve!(model::Model; nsteps::Int=10, tol::Float64=1e-8,
                 maxiter::Int=25, verbose::Bool=false,
-                linsolve::Symbol=:cg, amg::Symbol=:sa, smoother::Symbol=:gs,
+                linsolve::Symbol=:auto, amg::Symbol=:sa, smoother::Symbol=:gs,
                 cg_itmax::Int=200, threaded::Bool=(Threads.nthreads() > 1))
     reset!(model)   # idempotent: start from the undeformed, unhardened state
     dir_ramp, dir_fix, neu = _freeze_bcs(model)
     Fext = zeros(length(model.U))
+
+    # Symmetry-aware solver selection (B1 / FINITE_STRAIN §4.2). CG/AMG/SymThreadedK
+    # require K = Kᵀ; a non-symmetric tangent must use the direct solve.
+    sym = _tangent_symmetric(model)
+    if linsolve === :auto
+        linsolve = sym ? :cg : :direct
+    elseif linsolve === :cg && !sym
+        @warn "linsolve=:cg requested but the tangent is non-symmetric for this " *
+              "element/material (F-bar, or finite strain with kinematic hardening); " *
+              "overriding to :direct (CG/AMG assume K=Kᵀ)." maxlog=5
+        linsolve = :direct
+    end
+    # `ls.threaded` drives both the 8-color threaded assembly and the row-parallel
+    # `SymThreadedK` CG SpMV. The SpMV assumes K = Kᵀ, but it is ONLY reached on the
+    # `:cg` path, and a non-symmetric tangent has already been forced to `:direct`
+    # above — so the SpMV never sees a non-symmetric K. Threaded assembly is
+    # race-free regardless of symmetry, so keep it on for the direct path too.
+
     # rigid-body near-null-space for smoothed-aggregation AMG (flattens CG iters)
     nullspace = (linsolve === :cg && amg === :sa) ? _rigid_body_modes(model.mesh.nodes) : nothing
     ls = LinearSolveState(length(model.U); method=linsolve, amg=amg,

@@ -8,14 +8,17 @@ module ModelMod
 
 using SparseArrays
 using StaticArrays
-using ..MeshMod: Mesh, GaussState, dof
+using LinearAlgebra: det
+using ..MeshMod: Mesh, GaussState, dof, reset_state!
 using ..Materials: J2Material
-using ..Elements: ElementCache, precompute_cache
+using ..Elements: ElementCache, precompute_cache, element_geometry, element_ref_grads
+using ..FiniteStrain: ElementKind, Hex8Small, Hex8Finite, Hex8FiniteFbar, voigt_to_sym3
 using ..BoundaryConditions: DirichletBC, NeumannBC
 using ..Assembly: SparsityPattern, build_sparsity
 
 export Model, fix!, prescribe!, load!, reset!,
-       nodal_displacements, gauss_stress, equivalent_plastic_strain
+       nodal_displacements, gauss_stress, gauss_kirchhoff, equivalent_plastic_strain,
+       Hex8Small, Hex8Finite, Hex8FiniteFbar
 
 """
     Model(mesh, material)
@@ -26,9 +29,10 @@ preallocated once; `U` and buffers are reassignable (DESIGN §4.6).
 BCs/loads are accumulated in growable lists by the builder API and frozen into
 `DirichletBC`/`NeumannBC` at solve time.
 """
-mutable struct Model{Ti<:Integer}
+mutable struct Model{Ti<:Integer,EK<:ElementKind}
     mesh::Mesh
     material::J2Material
+    kind::EK                         # element kind (zero-size; static dispatch seam)
     cache::ElementCache
     sparsity::SparsityPattern{Ti}
     state_committed::GaussState
@@ -45,23 +49,41 @@ mutable struct Model{Ti<:Integer}
 end
 
 """
-    Model(mesh, material; Ti=nothing)
+    Model(mesh, material; element=:small, Ti=nothing)
 
-Build the assembled problem. `Ti` selects the sparse index type (default: `Int32`
-for large problems, else chosen by `build_sparsity`). The returned `Model` is
-parametric on the chosen index type.
+Build the assembled problem. `element` selects the kinematics / element family
+(FINITE_STRAIN §6.4):
+- `:small`       — small-strain Hex8 (default, v1 path, behaviorally unchanged);
+- `:finite`      — finite-strain Hex8 (standard F, Hencky/J2);
+- `:finite_fbar` — finite-strain Hex8 with F-bar (near-incompressible limit).
+
+`Ti` selects the sparse index type. The returned `Model` is parametric on the
+index type and the `ElementKind`, so the assembly hot loop dispatches statically.
 """
-function Model(mesh::Mesh, material::J2Material; Ti::Union{Type{<:Integer},Nothing}=nothing)
+function Model(mesh::Mesh, material::J2Material;
+               element::Symbol=:small, Ti::Union{Type{<:Integer},Nothing}=nothing)
     ndof = 3 * mesh.nnodes
     ngp = mesh.nelem * 8
     cache = precompute_cache(mesh.nodes, mesh.elements)
     sparsity = build_sparsity(mesh; Ti=Ti)
     Tidx = eltype(sparsity.K.colptr)
-    return Model{Tidx}(mesh, material, cache, sparsity,
+    kind = _element_kind(element)
+    return Model{Tidx,typeof(kind)}(mesh, material, kind, cache, sparsity,
                        GaussState(ngp), GaussState(ngp),
                        zeros(ndof), zeros(ndof), zeros(ndof),
                        Int[], Float64[], Bool[], Int[], Float64[])
 end
+
+function _element_kind(element::Symbol)
+    element === :small && return Hex8Small()
+    element === :finite && return Hex8Finite()
+    element === :finite_fbar && return Hex8FiniteFbar()
+    error("unknown element kind $element (use :small, :finite, :finite_fbar)")
+end
+
+# True for finite-strain element kinds (Kirchhoff stored, Cauchy reported).
+@inline _is_finite(::Model{Ti,Hex8Small}) where {Ti<:Integer} = false
+@inline _is_finite(::Model{Ti,EK}) where {Ti<:Integer,EK<:ElementKind} = true
 
 # component symbol -> list of component indices
 function _comps(comp::Symbol)
@@ -134,9 +156,8 @@ previous solve.
 """
 function reset!(model::Model)
     fill!(model.U, 0.0)
-    for st in (model.state_committed, model.state_trial)
-        fill!(st.εp, 0.0); fill!(st.β, 0.0); fill!(st.ᾱ, 0.0); fill!(st.σ, 0.0)
-    end
+    reset_state!(model.state_committed)
+    reset_state!(model.state_trial)
     return model
 end
 
@@ -158,8 +179,52 @@ end
 
 """
     gauss_stress(model) -> Matrix (6 × ngp)  committed stresses
+
+For small-strain models this is the stored Cauchy/engineering stress. For finite-
+strain models the stored quantity is the **Kirchhoff** stress τ; this function
+reports the **Cauchy** stress σ = τ/J (J = det F at the committed displacement),
+per FINITE_STRAIN §6.4. Use `gauss_kirchhoff` for the raw τ.
 """
-gauss_stress(model::Model) = model.state_committed.σ
+function gauss_stress(model::Model)
+    _is_finite(model) || return model.state_committed.σ
+    τ = model.state_committed.σ
+    σ = similar(τ)
+    edofs = model.sparsity.edofs
+    U = model.U
+    @inbounds for e in 1:model.mesh.nelem
+        ue = SVector{24,Float64}(ntuple(i -> U[edofs[i, e]], Val(24)))
+        dNdXs = element_ref_grads(model.cache, e)
+        for g in 1:8
+            gp = (e - 1) * 8 + g
+            F = _defgrad(ue, dNdXs[g])
+            J = det(F)
+            invJ = J > 0 ? 1.0 / J : 1.0
+            for k in 1:6
+                σ[k, gp] = τ[k, gp] * invJ
+            end
+        end
+    end
+    return σ
+end
+
+# local deformation gradient (avoids importing the kernel's helper namespace)
+@inline function _defgrad(ue::SVector{24,Float64}, dNdX)
+    H = zero(SMatrix{3,3,Float64,9})
+    @inbounds for a in 1:8
+        ux = ue[3(a - 1) + 1]; uy = ue[3(a - 1) + 2]; uz = ue[3(a - 1) + 3]
+        gx = dNdX[a, 1]; gy = dNdX[a, 2]; gz = dNdX[a, 3]
+        H += SMatrix{3,3,Float64,9}(ux * gx, uy * gx, uz * gx,
+                                    ux * gy, uy * gy, uz * gy,
+                                    ux * gz, uy * gz, uz * gz)
+    end
+    return SMatrix{3,3,Float64,9}(1, 0, 0, 0, 1, 0, 0, 0, 1) + H
+end
+
+"""
+    gauss_kirchhoff(model) -> Matrix (6 × ngp)  committed Kirchhoff stress τ
+(finite-strain models). For small strain this equals `gauss_stress`.
+"""
+gauss_kirchhoff(model::Model) = model.state_committed.σ
 
 """
     equivalent_plastic_strain(model) -> Vector (ngp)  committed ᾱ
