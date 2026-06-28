@@ -11,12 +11,17 @@
 #
 # Analytic check (St-Venant, square side a=1): the surface first yields at
 #   T_yield ≈ 0.208·a³·τ_y ,  τ_y = σy0/√3   ⇒   T_yield ≈ 0.208·250/√3 ≈ 30.0.
-# We ramp to T = 36 (~1.2× T_yield) so the onset and a small plastic zone are
-# clearly captured while strains stay small (small-strain theory valid).
+# We ramp to T = 72 (≈2.4× T_yield), well into the plastic regime. With the
+# FINITE-STRAIN element this produces a genuinely LARGE deformation: the free end
+# twists ≈0.7 rad (≈40°) with peak equivalent plastic strain ≈0.37 — a regime
+# small-strain kinematics cannot represent. Because the post-yield torsional
+# stiffness is low, the load is ramped in many small steps (nsteps=120) so the
+# Newton iterates stay in the convergence basin (a coarse increment would overshoot
+# into element inversion, which the finite element now flags loudly).
 #
 # Mesh is 160×16×16 (≈40.96k elements, ≈140k DOFs) — solved by the CG+AMG
 # iterative solver. Run me with threads, e.g.:
-#   JULIA_NUM_THREADS=4 julia --project=. examples/cantilever_torsion.jl
+#   JULIA_NUM_THREADS=8 julia --project=. examples/cantilever_torsion_T72.jl
 
 using PlasticityFEM
 
@@ -25,7 +30,9 @@ function main()
     L, b, h = 10.0, 1.0, 1.0
     mesh = box_mesh(L, b, h, 160, 16, 16)
     mat  = J2Material(E = 210e3, ν = 0.3, σy0 = 250.0, Hiso = 1000.0)  # mild-steel-like
-    model = Model(mesh, mat)
+    # Finite-strain (large-deformation) element. Isotropic hardening only ⇒ the
+    # consistent tangent is symmetric, so solve! keeps the CG+AMG scaling path.
+    model = Model(mesh, mat; element = :finite)
 
     # --- boundary conditions: clamp the x = 0 face ----------------------------
     fix!(model, on_face(mesh, :xmin))
@@ -53,7 +60,7 @@ function main()
     end
 
     # --- solve (load-stepped Newton + CG/AMG) ---------------------------------
-    res = solve!(model; nsteps = 30, tol = 1e-8, maxiter = 60)
+    res = solve!(model; nsteps = 120, tol = 1e-8, maxiter = 60)
 
     # --- postprocess ----------------------------------------------------------
     u   = nodal_displacements(model)
@@ -72,7 +79,7 @@ function main()
     end
     twist = num / den          # radians of twist of the free end
 
-    println("=== torsion of a 10×1×1 cantilever to first yield ===")
+    println("=== torsion of a 10×1×1 cantilever (FINITE STRAIN) ===")
     println("mesh                 : 160×16×16  ($(mesh.nelem) elems, $(3*mesh.nnodes) DOFs)")
     println("applied torque T     : ", T_total, "   (analytic yield torque ≈ 30.0)")
     println("converged            : ", res.converged)

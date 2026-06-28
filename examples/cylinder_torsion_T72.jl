@@ -1,27 +1,34 @@
 # Torsion of a CYLINDRICAL cantilever — round-vs-square comparison.
 #
-# Companion to cantilever_torsion.jl: the same length (L=10) and the same
+# Companion to cantilever_torsion_T72.jl: the same length (L=10) and the same
 # cross-sectional AREA (1.0, matching the 1×1 square ⇒ a solid circle of radius
-# R = 1/√π ≈ 0.564), the same clamp (x=0), and the SAME applied torque (T=36)
-# about the long axis. Only the cross-section shape differs.
+# R = 1/√π ≈ 0.564), the same clamp (x=0), and the SAME applied torque (T=72)
+# about the long axis. Only the cross-section shape differs. Uses the FINITE-STRAIN
+# element (see cantilever_torsion_T72.jl).
 #
 # Why this is an instructive comparison: the solid circle is the *optimal* torsion
-# section. A square shaft concentrates shear at the mid-points of its edges (and
-# carries zero stress at its corners), so under T=36 it yields (peak von-Mises
-# ≈ √3·T/(0.208·a³) ≈ 300 > 250). A circle of equal area spreads the same torque
-# over a smoother boundary: peak von-Mises ≈ √3·2T/(πR³) ≈ 221 < 250, so in the
-# St-Venant (free-warping) region it stays ELASTIC under the identical torque.
-# (Its surface would first yield near T ≈ π R³ σy0 /(2√3) ≈ 40.7.) Restrained
-# warping at the clamped end still concentrates stress there, so any yielding
-# shows up as a ring near the root rather than along the span.
+# section. In the small-strain first-yield sense, a square concentrates shear at
+# its edge mid-points (yield torque ≈ 0.208·a³·σy0/√3 ≈ 30), while an equal-area
+# circle spreads it over a smoother boundary (yield torque ≈ π R³ σy0/(2√3) ≈ 40.7)
+# — so the circle is the stiffer, later-yielding section.
+#
+# But T=72 is ≈1.8–2.4× those yield torques, and with FINITE STRAIN the bars twist
+# into a genuinely large-deformation, fully-plastic regime (end twist ≈0.6–0.7 rad,
+# ≈35–40°). At this load essentially the whole cross-section yields for BOTH shapes
+# — not the small-strain picture of a thin yielded ring. The round shaft, being the
+# stiffer section, twists slightly LESS than the square for the same torque, yet
+# develops a higher peak von-Mises / plastic strain. Compare the two .vtu files in
+# ParaView (Warp By Vector + colour by EqPlasticStrain) to see the difference.
 #
 # The mesh is an all-hex O-grid: a structured n×n grid on the square [-1,1]² is
 # mapped onto the disk by the smooth concentric (elliptical) map, then extruded
 # along x. This keeps every element a valid 8-node hex (no degenerate wedge at the
 # centre that a naive polar mesh would create). With n=16, nx=160 the grid is
 # topologically 16×16×160 — (17²·161)=46,529 nodes = 139,587 DOFs, identical to
-# the 160×16×16 box. Solved with CG+AMG. Run with threads:
-#   JULIA_NUM_THREADS=4 julia --project=. examples/cylinder_torsion.jl
+# the 160×16×16 box. Solved with CG+AMG. The O-grid is a distorted (non-uniform)
+# mesh, so the finite-strain solve recomputes element geometry every iteration and
+# is noticeably slower than the uniform box — run with threads:
+#   JULIA_NUM_THREADS=8 julia --project=. examples/cylinder_torsion_T72.jl
 
 using PlasticityFEM
 
@@ -71,7 +78,9 @@ function main()
     R = 1 / sqrt(π)                       # area = πR² = 1.0 (same as the 1×1 square)
     mesh = cylinder_mesh(L, R, 16, 160)   # 16×16×160 grid → 46,529 nodes = 139,587 DOFs
     mat  = J2Material(E = 210e3, ν = 0.3, σy0 = 250.0, Hiso = 1000.0)
-    model = Model(mesh, mat)
+    # Finite-strain (large-deformation) element. Isotropic hardening only ⇒ the
+    # consistent tangent is symmetric, so solve! keeps the CG+AMG scaling path.
+    model = Model(mesh, mat; element = :finite)
 
     # clamp the base disk (x = 0 face)
     fix!(model, on_face(mesh, :xmin))
@@ -92,7 +101,7 @@ function main()
         load!(model, [nd], :z,  k * y)
     end
 
-    res = solve!(model; nsteps = 30, tol = 1e-8, maxiter = 60)
+    res = solve!(model; nsteps = 120, tol = 1e-8, maxiter = 60)
 
     # postprocess
     u   = nodal_displacements(model)
@@ -109,7 +118,7 @@ function main()
     end
     twist = num / den                     # radians of twist of the free end
 
-    println("=== torsion of a CYLINDRICAL cantilever (same area & torque as the square) ===")
+    println("=== torsion of a CYLINDRICAL cantilever (FINITE STRAIN; same area & torque as the square) ===")
     println("radius R / area      : ", R, " / ", π * R^2)
     println("mesh                 : 16×16×160 O-grid  ($(mesh.nelem) elems, $(3*mesh.nnodes) DOFs)")
     println("applied torque T     : ", T_total, "   (circular yield torque ≈ 40.7; square's ≈ 30)")
@@ -118,7 +127,7 @@ function main()
     println("max von Mises stress : ", σvm_max, "   (yield σy0 = 250)")
     println("max eq. plastic strn : ", maximum(ᾱ))
     println("yielded Gauss points : ", count(>(0.0), ᾱ), " / ", ngp,
-            "  (expect ≈0 in the span; any yielding is the restrained-warping ring at the clamp)")
+            "  (finite-strain large twist ⇒ nearly the whole section is plastic)")
 
     println("\nwrote: ", write_vtu(joinpath(@__DIR__, "cylinder_torsion_T72"), model))
     return res.converged
