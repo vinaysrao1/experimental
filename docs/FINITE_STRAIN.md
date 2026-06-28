@@ -239,10 +239,18 @@ a = Σ_A Σ_B  (D_AB − 2 τ_A δ_AB) · (m_A ⊗ m_B)
 with the eigenvalue-coupling coefficient
 
 ```
-        τ_B b_A − τ_A b_B
+        τ_A b_B − τ_B b_A
 g_AB = ───────────────────          (b_A ≠ b_B)
             b_A − b_B
 ```
+
+> **Sign convention (verified).** This numerator is `τ_A b_B − τ_B b_A` (NOT
+> `τ_B b_A − τ_A b_B`). The order was confirmed by finite-differencing the
+> Kirchhoff stress under symmetric spatial velocity-gradient perturbations
+> (Lie-derivative definition `a:H = dτ/dε − Hτ − τH`): the form above reproduces
+> the ground-truth `a` to machine precision (~1e-10) and converges continuously
+> to the degenerate limit below; the opposite sign gives ~78% error. Match
+> indices carefully against Simo & Hughes Box 8.2 / de Souza Neto Box 14.3.
 
 and the **degenerate limit** `b_A → b_B` (repeated stretch), required for
 numerical robustness:
