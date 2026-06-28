@@ -235,7 +235,72 @@ proportion to the model size, which is the best one can hope for.
 
 ---
 
-## 6. Why this is a satisfying piece of computational science
+## 6. When the bending is for real: finite strain
+
+Everything so far quietly assumed the deformations are **small** — that the shape
+barely changes, so we can do the bookkeeping on the *original* geometry. That's
+fine for a bridge that sags a few millimeters. It is hopelessly wrong for a
+paperclip you fold in half, a metal can you crush, or a tensile bar that stretches
+until it **necks** down and snaps. There the rotations are large and the geometry
+changes so much that "where things are" is part of the unknown. This regime is
+called **finite strain** (or large deformation), and the program handles it as a
+second mode you switch on with one keyword.
+
+Two ideas make it work.
+
+**You can't just add up stretches anymore — you multiply them.** At small strain,
+total = elastic + plastic, a simple sum. At large strain, deformation *compounds*
+like compound interest: the program splits the total stretch into a plastic part
+(the permanent reshaping) followed by an elastic part (the springy bit on top),
+**multiplied** together rather than added. Picture stretching a rubber sheet that
+already has a permanent bulge: the new stretch acts *on top of* the bulged shape,
+so the order and the geometry matter.
+
+**The beautiful trick: change your ruler and the old machinery comes back.** This
+is the part that makes the whole thing tractable. If you measure stretch on a
+**logarithmic** ruler (so "stretch by 2×" and "stretch by 2× again" *add up* to
+"4×"), and you first mentally **un-rotate** the material to a neutral pose, then —
+remarkably — the large-strain problem looks *algebraically identical* to the
+small-strain one in that rotated, log-stretched frame. So the exact same,
+already-verified "return mapping" from §4 is reused without change; finite strain
+is a geometric *wrapper* that translates into and out of this convenient frame.
+(This is a classical result — Simo, 1992.) A nice bonus falls out for free:
+because plastic flow shuffles shape but doesn't change volume, the logarithmic
+bookkeeping conserves volume **exactly**, which the small-strain version could only
+approximate.
+
+This buys two things you genuinely can't get otherwise:
+
+- **Necking.** Pull a bar hard enough and it doesn't thin uniformly — at some point
+  the deformation *localizes* into a narrowing neck that runs away to failure. That
+  is a large-deformation, large-rotation, nearly-incompressible phenomenon; the
+  program reproduces the classic necking benchmark.
+- **Large rotations and buckling** — a cantilever that swings through a big angle, a
+  shaft twisted hard. The forces must be computed on the *deformed* shape, which the
+  finite-strain "initial-stress" stiffness accounts for.
+
+Two subtleties are worth naming, because getting them wrong is a classic trap:
+
+- **Objectivity (the physics can't depend on how you're looking at it).** If you
+  pick up a stressed object and merely *rotate* it, no new stress should appear.
+  Naively-stored internal memory (the "back-stress" of kinematic hardening) breaks
+  this — it doesn't turn with the object. The fix is to store that memory in the
+  un-rotated frame and rotate it back in on demand, so the model gives the same
+  answer no matter how the object is oriented.
+- **Locking, and the F-bar cure.** Plastic flow preserves volume, and simple brick
+  elements are bad at deforming while *exactly* preserving volume — they go
+  artificially stiff ("locking"). A standard remedy, **F-bar**, lets each element
+  take its volume-change from a single representative point, relaxing the
+  over-constraint. It's the large-strain version of a well-known small-strain trick.
+
+One practical consequence: in these harder cases the big matrix the solver works
+with is no longer **symmetric** (a property the fast Conjugate-Gradient method
+relied on). The program detects this and quietly switches to a solver that doesn't
+need symmetry — so the user still just calls `solve!`.
+
+---
+
+## 7. Why this is a satisfying piece of computational science
 
 Plasticity sits at a sweet spot. The physics is **tangible** — you can feel it in
 a paperclip — yet encoding it faithfully forces you through real depth: a yield
