@@ -310,6 +310,39 @@ end
     @test symerr > 1e-6           # and is genuinely NON-symmetric here
 end
 
+@testset "F11 symmetry-aware solver: DEFAULT solve on non-symmetric tangents (B1)" begin
+    # Validator's crash repro: :finite_fbar with DEFAULT solve! args used to HARD
+    # CRASH (cg! raises an SPD error on the non-symmetric F-bar tangent before the
+    # fallback could run). :auto must now pick :direct and run to convergence, and
+    # the result must match an explicit :direct solve. Same for :finite + Hkin>0.
+    function run(elem, mat, linsolve)
+        mesh = box_mesh(1.0, 1.0, 1.0, 3, 3, 3)
+        model = Model(mesh, mat; element=elem)
+        fix!(model, on_face(mesh, :xmin), :x)
+        fix!(model, on_face(mesh, :ymin), :y)
+        fix!(model, on_face(mesh, :zmin), :z)
+        prescribe!(model, on_face(mesh, :xmax), :x, 0.08)
+        res = linsolve === nothing ? solve!(model; nsteps=4) :
+                                     solve!(model; nsteps=4, linsolve=linsolve)
+        return res.converged, copy(model.U)
+    end
+    # (a) F-bar, near-incompressible, isotropic — non-symmetric (F-bar always)
+    matf = J2Material(E=210e3, ν=0.49, σy0=250.0, Hiso=1000.0)
+    cdef, udef = run(:finite_fbar, matf, nothing)     # DEFAULT (:auto)
+    cdir, udir = run(:finite_fbar, matf, :direct)
+    @test cdef && cdir
+    @test norm(udef - udir) / norm(udir) < 1e-10      # auto == direct
+    # (b) finite strain + kinematic hardening — non-symmetric (objective β rotation)
+    matk = J2Material(E=210e3, ν=0.3, σy0=250.0, Hiso=200.0, Hkin=2000.0)
+    ckdef, ukdef = run(:finite, matk, nothing)
+    ckdir, ukdir = run(:finite, matk, :direct)
+    @test ckdef && ckdir
+    @test norm(ukdef - ukdir) / norm(ukdir) < 1e-10
+    # (c) forcing :cg on a non-symmetric config warns and overrides to :direct
+    cforce, _ = run(:finite_fbar, matf, :cg)
+    @test cforce
+end
+
 @testset "F10 allocation gates (finite kernel + assembly O(1))" begin
     function kern()
         mat = J2Material(E=210e3, ν=0.3, σy0=250.0, Hiso=1000.0, Hkin=500.0)
